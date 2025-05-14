@@ -3264,6 +3264,15 @@ cc_library(
     ],
 )
 
+load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
+
+refresh_compile_commands(
+    name = "refresh_compile_commands",
+    targets = {
+         "//xla/service:hlo_execution_profile":""
+    },
+)
+
 xla_cc_test(
     name = "hlo_cost_analysis_test",
     srcs = ["hlo_cost_analysis_test.cc"],

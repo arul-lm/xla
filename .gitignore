@@ -25,3 +25,6 @@ tools/python_bin_path.sh
 *.VC.opendb
 *.suo
 *.user
+*.mlir
+raw_torch_trace/*
+raw_trace/*

@@ -41,6 +41,7 @@ xla_cc_binary(
         "//xla/service:latency_hiding_scheduler",
         "//xla/service/gpu:gpu_latency_hiding_scheduler",
         "//xla/service/gpu/model:sol_latency_estimator",
+        "//xla/service/gpu:gpu_hlo_schedule",
         "//xla/stream_executor:device_description",
         "//xla/tsl/platform:status",
         "@com_google_absl//absl/log",

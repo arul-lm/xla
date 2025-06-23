@@ -509,9 +509,33 @@ absl::Status GpuHloCostAnalysis::HandleAllGather(const HloInstruction* hlo) {
   int64_t read_bytes = rank_size_bytes * num_ranks;
 
   current_properties_[kBytesAccessedKey] = write_bytes + read_bytes;
+
+
   current_properties_[kCollBytesTransferred] = bytes_transferred;
+  int num_intra_steps = 2 * (num_ranks - 1);
+  float scaling_ratio = (1.0 * num_ranks) / num_intra_steps;
+  current_properties_[kCollAlgoScaleRatioKey] = scaling_ratio;
 
   return absl::OkStatus();
+}
+
+absl::Status GpuHloCostAnalysis::HandleCollectivePermute(const HloInstruction* hlo) {
+    const auto* coll_perm_inst = Cast<HloCollectivePermuteInstruction>(hlo);
+    auto st_pairs = coll_perm_inst->source_target_pairs();
+    auto num_ranks = st_pairs.size();
+    int64_t bytes_transferred = ShapeSize(hlo->shape(), options_.shape_size);
+    int64_t rank_size_bytes = bytes_transferred / num_ranks;
+    int64_t write_bytes = rank_size_bytes * (2 * num_ranks - 1);
+    int64_t read_bytes = rank_size_bytes * num_ranks;
+
+    current_properties_[kBytesAccessedKey] = write_bytes + read_bytes;
+
+    current_properties_[kCollBytesTransferred] = bytes_transferred;
+    int num_intra_steps = 2 * (num_ranks - 1);
+    float scaling_ratio = (1.0 * num_ranks) / num_intra_steps;
+    current_properties_[kCollAlgoScaleRatioKey] = scaling_ratio;
+
+    return absl::OkStatus();
 }
 
 absl::Status GpuHloCostAnalysis::HandleAllGatherStart(

@@ -43,6 +43,7 @@ xla_cc_binary(
         "//xla/service/gpu/model:sol_latency_estimator",
         "//xla/service/gpu:gpu_hlo_schedule",
         "//xla/stream_executor:device_description",
+        "//xla/stream_executor:device_description_proto_cc",
         "//xla/tsl/platform:status",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/time",

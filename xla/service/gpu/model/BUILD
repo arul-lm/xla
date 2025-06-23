@@ -1,6 +1,6 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
-load("//xla:xla.default.bzl", "xla_cc_test")
+load("//xla:xla.default.bzl", "xla_cc_test", "xla_cc_binary")
 
 # Libraries for performance modeling of HLO.
 load("//xla/tests:build_defs.bzl", "xla_test")
@@ -20,6 +20,43 @@ package_group(
     includes = [
         "//xla:friends",
     ],
+)
+
+load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
+
+xla_cc_binary(
+    name = "analytical_latency_calculator",
+    srcs = ["analytical_latency_calculator.cc"],
+    deps = [
+        ":analytical_latency_estimator",
+        ":gpu_collective_performance_model",
+        ":gpu_hlo_cost_analysis",
+        ":gpu_performance_model",
+        ":gpu_performance_model_base",
+        "//xla/tools:hlo_module_loader",
+        "//xla:xla_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/service:hlo_cost_analysis",
+        "//xla/service:latency_hiding_scheduler",
+        "//xla/service/gpu:gpu_latency_hiding_scheduler",
+        "//xla/service/gpu/model:sol_latency_estimator",
+        "//xla/service/gpu:gpu_hlo_schedule",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:device_description_proto_cc",
+        "//xla/tsl/platform:status",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+refresh_compile_commands(
+    name = "refresh_compile_commands",
+    targets = {
+         # "//xla/service/model/gpu:analytical_latency_estimator":"",
+         # "//xla/service/model/gpu:sol_latency_estimator":""
+         ":analytical_latency_calculator": ""
+    },
 )
 
 cc_library(

@@ -14,7 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "xla/service/gpu/model/gpu_performance_model_base.h"
-
+#include "iostream"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -337,15 +337,21 @@ absl::Duration GpuPerformanceModelBase::WriteTime(
 int64_t GpuPerformanceModelBase::CalculateEffectiveFlopsPerNs(
     const se::DeviceDescription& gpu_device_info, int64_t num_blocks,
     int64_t num_threads_per_block) {
-  int64_t n_active_fpus_per_core =
-      std::min<int64_t>(num_threads_per_block, gpu_device_info.fpus_per_core());
+  // int64_t n_active_fpus_per_core =
+  //     std::min<int64_t>(num_threads_per_block, gpu_device_info.fpus_per_core());
 
-  int64_t n_active_core =
-      std::min<int64_t>(num_blocks, gpu_device_info.core_count());
+  // int64_t n_active_core =
+  //     std::min<int64_t>(num_blocks, gpu_device_info.core_count());
+
+    // FIXME: Always use max number of cores
+  int64_t n_active_fpus_per_core = gpu_device_info.fpus_per_core();
+  int64_t n_active_core = gpu_device_info.core_count();
+
   int64_t fpu_count = n_active_core * n_active_fpus_per_core;
 
   int64_t flop_per_ns_per_fpu = gpu_device_info.clock_rate_ghz() * /*fma:*/ 2;
-  return flop_per_ns_per_fpu * fpu_count;
+  auto flop_per_ns = flop_per_ns_per_fpu * fpu_count;
+  return flop_per_ns;
 }
 
 /*static*/

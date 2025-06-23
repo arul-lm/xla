@@ -52,19 +52,26 @@ enum class CollectiveAlgo {
 struct CudaBandwidthSettings {
   // Table for max system bandwidths GB/s for using NCCL's low latency
   // algorithm. This is used for intra-node estimate.
-  static constexpr std::array<double, 5> kLowLatencyMaxBandwidths = {
-      39.0 /* Volta */,      87.7 /* Ampere */,    141.0 /* Hopper */,
-      141.0 /* Blackwell */, 141.0 /* next-gen */,
-  };
+  // static constexpr std::array<double, 5> kLowLatencyMaxBandwidths = {
+  //     39.0 /* Volta */,      87.7 /* Ampere */,    141.0 /* Hopper */,
+  //     141.0 /* Blackwell */, 141.0 /* next-gen */,
+  // };
 
+  static constexpr std::array<double, 5> kLowLatencyMaxBandwidths = {
+      300.0, 600.0, 900.0, 900.0, 900.0};
   const std::vector<double>& GetIntraNodeBandwidths() const {
     // Different tiers for intra-node bandwidth.
     static const std::vector<double>* kIntraNodeSpeeds =
-        new std::vector<double>{3.0,  4.0,  5.0,  6.0,  7.0,  9.0, 10.0,
-                                12.0, 15.0, 18.0, 20.0, 30.0, 40.0};
+        // new std::vector<double>{3.0,  4.0,  5.0,  6.0,  7.0,  9.0, 10.0,
+        //                         12.0, 15.0, 18.0, 20.0, 30.0, 40.0};
+        new std::vector<double>{100.0, 200.0, 300.0, 400.0, 500.0, 600.0};
     // SM90 has different bandwidths.
-    static std::vector<double>* kIntraNodeSpeedsSm90 = new std::vector<double>{
-        3.0, 6.0, 12.0, 15.0, 20.0, 24.0, 30.0, 40.0, 60.0};
+    static std::vector<double>* kIntraNodeSpeedsSm90 =
+        // new std::vector<double>{
+        // 3.0, 6.0, 12.0, 15.0, 20.0, 24.0, 30.0, 40.0, 60.0};
+        new std::vector<double>{100.0, 200.0, 300.0, 400.0, 500.0,
+                                600.0, 700.0, 800.0, 900.0};
+
     return compute_capability.major >= se::CudaComputeCapability::kHopper
                ? *kIntraNodeSpeedsSm90
                : *kIntraNodeSpeeds;
@@ -81,7 +88,7 @@ struct CudaBandwidthSettings {
       case se::CudaComputeCapability::kBlackwell:
         return bandwidths_table[3];
       default:
-        return bandwidths_table[4];
+        return bandwidths_table[0];
     }
   }
 
@@ -100,20 +107,25 @@ struct CudaBandwidthSettings {
 
   // Max bandwidth in GB/s for ring low latency 128 algorithm per channel on a
   // single-node
-  static constexpr std::array<double, 5> kPerChannelMaxRingLL128Bandwidths = {
+  static constexpr std::array<double, 5> kPerChannelMaxRingLL128Bandwidths =
+  {
       20.0 /* Volta */,     20.0 /* Ampere */,   36.7 /* Hopper */,
       36.7 /* Blackwell */, 36.7 /* next-gen */,
   };
 
   // Nvlink unidirectional bandwidth for different compute cap. Note this is per
   // lane bandwidth.
-  static constexpr double kSm60NvlinkBandwidth = 18.0;
-  static constexpr double kSm70NvlinkBandwidth = 20.0;
-  static constexpr double kSm80NvlinkBandwidth = 20.0;
-  static constexpr double kSm90NvlinkBandwidth = 20.0;
+  // static constexpr double kSm60NvlinkBandwidth = 18.0;
+  // static constexpr double kSm70NvlinkBandwidth = 20.0;
+  // static constexpr double kSm80NvlinkBandwidth = 20.0;
+  // static constexpr double kSm90NvlinkBandwidth = 20.0;
 
+  static constexpr double kSm60NvlinkBandwidth = 37.5;
+  static constexpr double kSm70NvlinkBandwidth = 50.0;
+  static constexpr double kSm80NvlinkBandwidth = 50.0;
+  static constexpr double kSm90NvlinkBandwidth = 50.0;
   // PCIE bandwidth for PCI Gen3 x16
-  static constexpr double kPciBandwidth = 12.0;
+  static constexpr double kPciBandwidth = 32.0;
 
   // Discount factor for ring algorithm
   static constexpr double kRingAlgorithmDiscountFactor = 0.92;
@@ -236,6 +248,8 @@ float GetMaxLowLatencyBandwidth(const BandwidthSettings& bandwidth_settings) {
   auto max_sys_bw = bandwidth_settings.GetMaxSysBwFromGpu(
       bandwidth_settings.kLowLatencyMaxBandwidths.data());
   auto it = std::lower_bound(std::begin(speeds), std::end(speeds), max_sys_bw);
+  std::cout << "LOW BANDWIDTH FOUND:" << max_sys_bw << "\t" << *it << "\n";
+  std::cout << std::flush;
   CHECK(it != std::cend(speeds));
   return *it;
 }
@@ -313,6 +327,7 @@ absl::Duration ComputeAllreduceTimeImpl(
   absl::Duration total_time = kNcclKernelLaunchOverhead;
 
   float bw_intra_node = GetMaxLowLatencyBandwidth(bandwidth_settings);
+  // float bw_intra_node = 20;
   int64_t num_devices = cost_analysis->NumOfDevices(instr);
 
   int64_t min_nchannels =
@@ -337,9 +352,10 @@ absl::Duration ComputeAllreduceTimeImpl(
           /*num_blocks=*/num_channels, /*num_threads_per_block=*/num_threads);
   total_time += compute_time_per_channel;
 
-  uint32_t supported_p2p =
-      GpuPerformanceWithCollectiveModel::CheckIfNvlinkSupportsP2P();
+  // uint32_t supported_p2p =
+  //     GpuPerformanceWithCollectiveModel::CheckIfNvlinkSupportsP2P();
 
+  uint32_t supported_p2p = 1;
   if (supported_p2p == 0) {
     VLOG(8) << "Nvlink doesn't support p2p communication. Model will "
                "continue using default system bandwidth.";
@@ -363,6 +379,7 @@ absl::Duration ComputeAllreduceTimeImpl(
   absl::Duration communication_time = absl::Milliseconds(
       cost_analysis->bytes_accessed(instr) / (1e6 * actual_bandwidth));
   total_time += communication_time;
+
   return total_time;
 }
 
@@ -488,6 +505,8 @@ GpuPerformanceWithCollectiveModel::ComputeCollectiveTime(
     return absl::ZeroDuration();
   }
   switch (instr.opcode()) {
+    case HloOpcode::kCollectivePermute:
+    case HloOpcode::kAllGather:
     case HloOpcode::kAllReduce:
     case HloOpcode::kAllReduceStart:
       return ComputeAllreduceTime(instr, cost_analysis, gpu_device_info);

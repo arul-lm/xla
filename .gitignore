@@ -33,3 +33,16 @@ tools/python_bin_path.sh
 .cache
 compile_commands.json
 external
+*.mlir
+raw_torch_trace/*
+raw_trace/*
+overlap_*/
+bazelCache/*
+hlo_pre_*
+gpu_stats_*
+stats/*
+testlogs/*
+*_stats/*
+hlo/*
+xla/tools/hlo_opt/gpu_specs/*l200.txtpb
+

@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/gpu/model/gpu_performance_model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 
@@ -54,6 +55,175 @@ GpuPerformanceModel::GpuPerformanceModel(
       gpu_performance_model_cache_(gpu_performance_model_cache),
       mlir_context_(mlir_context) {};
 
+// Helper function to convert FPU core calculations to tensor core calculations
+// based on primitive type
+absl::Duration ConvertFPUToTensorCore(absl::Duration compute_time,
+                                      const xla::HloInstruction* instr) {
+  auto prim_type = instr->shape().element_type();
+  switch (prim_type) {
+    case xla::PrimitiveType::F16:
+    case xla::PrimitiveType::BF16: {
+      // F16/BF16 operations can use tensor cores with 16x speedup
+      compute_time = compute_time / 16.0;
+      break;
+    }
+    case xla::PrimitiveType::F32: {
+      // F32 operations can use tensor cores with 8x speedup
+      compute_time = compute_time / 8.0;
+      break;
+    }
+    case xla::PrimitiveType::F64: {
+      // F64 operations typically don't use tensor cores, but some GPUs support
+      // them with 4x speedup for mixed precision
+      compute_time = compute_time / 4.0;
+      break;
+    }
+    case xla::PrimitiveType::S8:
+    case xla::PrimitiveType::U8: {
+      // INT8 operations can use tensor cores with 32x speedup
+      compute_time = compute_time / 32.0;
+      break;
+    }
+    case xla::PrimitiveType::S16:
+    case xla::PrimitiveType::U16: {
+      // INT16 operations can use tensor cores with 16x speedup
+      compute_time = compute_time / 16.0;
+      break;
+    }
+    case xla::PrimitiveType::S32:
+    case xla::PrimitiveType::U32: {
+      // INT32 operations can use tensor cores with 8x speedup
+      compute_time = compute_time / 8.0;
+      break;
+    }
+    case xla::PrimitiveType::F8E5M2:
+    case xla::PrimitiveType::F8E4M3FN:
+    case xla::PrimitiveType::F8E4M3B11FNUZ:
+    case xla::PrimitiveType::F8E5M2FNUZ:
+    case xla::PrimitiveType::F8E4M3FNUZ: {
+      // FP8 operations can use tensor cores with 64x speedup
+      compute_time = compute_time / 64.0;
+      break;
+    }
+    default: {
+      // For other types (PRED, S64, U64, C64, C128), use default FPU core
+      // calculation
+      compute_time = compute_time /
+                     14.9;  // Compute time is calculated for default fpu cores
+      break;
+    }
+  }
+  return compute_time;
+}
+
+bool IsTpuDevice(const stream_executor::DeviceDescription& device_info) {
+  auto name = device_info.name();
+  std::string lower_name = absl::AsciiStrToLower(name);
+  return absl::StrContains(lower_name, "tpu");
+}
+
+bool IsBlackwell(const stream_executor::DeviceDescription& device_info) {
+    auto name = device_info.name();
+    std::string lower_name = absl::AsciiStrToLower(name);
+    return absl::StrContains(lower_name, "b200");
+}
+
+// Helper function to get Blackwell tensor core multiplier based on data type
+// Returns a multiplier relative to bf16 performance (1.0 = bf16 baseline)
+double GetBlackwellDataTypeMultiplier(const xla::HloInstruction* instr) {
+  if (!instr) return 1.0;
+
+  auto prim_type = instr->shape().element_type();
+  switch (prim_type) {
+    case xla::PrimitiveType::F16:
+    case xla::PrimitiveType::BF16:
+      return 1.0;  // Base case (bf16)
+    case xla::PrimitiveType::F32:
+      return 0.5;  // F32 is 2x slower than bf16 on tensor cores
+    case xla::PrimitiveType::S8:
+    case xla::PrimitiveType::U8:
+      return 2.0;  // INT8 is 2x faster than bf16 (32x vs 16x speedup from ConvertFPUToTensorCore)
+    case xla::PrimitiveType::S16:
+    case xla::PrimitiveType::U16:
+      return 1.0;  // INT16 same as bf16
+    case xla::PrimitiveType::S32:
+    case xla::PrimitiveType::U32:
+      return 0.5;  // INT32 is 2x slower than bf16
+    case xla::PrimitiveType::F8E5M2:
+    case xla::PrimitiveType::F8E4M3FN:
+    case xla::PrimitiveType::F8E4M3B11FNUZ:
+    case xla::PrimitiveType::F8E5M2FNUZ:
+    case xla::PrimitiveType::F8E4M3FNUZ:
+      return 2.0;  // FP8 is 4x faster than bf16 (64x vs 16x speedup from ConvertFPUToTensorCore)
+    default:
+      return 1.0;  // Default to bf16 performance
+  }
+}
+
+absl::Duration ComputeBlackwellTime(
+    const stream_executor::DeviceDescription& gpu_device_info,
+    int64_t flops,
+    int64_t num_blocks,
+    int64_t num_threads_per_block,
+    const xla::HloInstruction* instr) {
+    // Uses tensor cores
+    // grouped by warp-group MMA instruction that can handle matrices of size 256x256x16
+    // Base calculation assumes bf16. Apply multiplicative factor for other types.
+    auto max_bf16_ops = 256 * 256 * 16 * gpu_device_info.clock_rate_ghz();
+    auto sparse_boost = 2.0f;
+
+    // Get data type multiplier based on instruction's element type
+    double data_type_multiplier = GetBlackwellDataTypeMultiplier(instr);
+
+    auto max_ops_with_boost = max_bf16_ops * sparse_boost * data_type_multiplier;
+    // Revert to linear: return absl::Nanoseconds(1.0f * flops / max_ops_with_boost);
+
+    // Apply saturation model: super-linear → linear transition
+    // B200 saturation model parameters (hardware-tuned)
+    constexpr double kU_MAX = 0.80;           // Sustained utilization ceiling
+    constexpr double kKAPPA = 0.04;          // Ramp steepness
+    constexpr double kF_REF = 1e12;          // 1 TFLOP reference for saturation onset
+    constexpr double kU_MIN = 0.1;
+    // Calculate utilization based on saturation model
+    double utilization = std::max(kU_MIN, kU_MAX * (1.0 - std::exp(-kKAPPA * static_cast<double>(flops) / kF_REF)));
+    // double utilization = 1.0;
+    // Effective FLOPS per nanosecond = max_ops_with_boost * utilization
+    // Note: max_ops_with_boost is in units of ops per nanosecond
+    double effective_flops_per_nanosecond = max_ops_with_boost * utilization;
+    //std::cout << "flops:" << flops << "\n";
+    //std::cout << "effective_flops_per_nanosecond:" << effective_flops_per_nanosecond << "\n";
+    double compute_time_nanoseconds = static_cast<double>(flops) / effective_flops_per_nanosecond;
+    return absl::Nanoseconds(compute_time_nanoseconds);
+}
+
+absl::Duration ComputeTpuTime(
+    const stream_executor::DeviceDescription& tpu_device_info, int64_t flops,
+    int64_t num_blocks, int64_t num_threads_per_block) {
+  // For TPU: num_threads_per_block = MXU size (128x128 = 16384)
+  // num_blocks = number of MXUs
+  //   int64_t n_active_mxus = num_blocks;
+  //   int64_t n_active_elements_per_mxu = num_threads_per_block;
+
+  // int64_t total_active_elements = n_active_mxus * n_active_elements_per_mxu;
+
+  // // Each element performs 2 FLOPS (multiply + add)
+  // int64_t flops_per_ns_per_element = tpu_device_info.clock_rate_ghz() * 2;
+  // int64_t effective_flops_per_ns =
+  //     flops_per_ns_per_element * total_active_elements;
+  // std::cout << "FLOPS:" << flops << "\n";
+  // std::cout << "FPNE:" << effective_flops_per_ns << "\n";
+    int64_t n_active_fpus_per_core = tpu_device_info.fpus_per_core();
+    int64_t n_active_core = tpu_device_info.core_count();
+    int64_t fpu_count = n_active_core * n_active_fpus_per_core;
+    double flop_per_ns_per_fpu = tpu_device_info.clock_rate_ghz() * /*fma:*/ 2;
+    auto flop_per_ns = flop_per_ns_per_fpu * fpu_count;
+    // std::cout << "active_fpus_per_core:" << n_active_fpus_per_core << "\n";
+    // std::cout << "active_core:" << n_active_core << "\n";
+    // std::cout << "fpu_count:" << fpu_count << "\n";
+    // std::cout << "flop_per_ns" << flop_per_ns << "\n";
+  return absl::Nanoseconds(1.0f * flops / flop_per_ns);
+}
+
 EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(
     const HloInstruction* instr, const GpuHloCostAnalysis* cost_analysis) {
   VLOG(8) << "EstimateRunTimeForInstruction: " << instr->name();
@@ -66,9 +236,18 @@ EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(
       EstimateFusionLaunchDimensions(fusion_analysis, mlir_context_);
   int64_t num_blocks = launch_dimensions.num_blocks();
 
-  absl::Duration compute_time =
-      ComputeTime(device_info_, flops, num_blocks,
-                  launch_dimensions.num_threads_per_block());
+  absl::Duration compute_time;
+  if(IsTpuDevice(device_info_)){
+      compute_time = ComputeTpuTime(device_info_, flops, num_blocks, launch_dimensions.num_threads_per_block());
+  } else if(IsBlackwell(device_info_)){
+      compute_time = ComputeBlackwellTime(device_info_, flops, num_blocks, launch_dimensions.num_threads_per_block(), instr);
+  }
+  else {
+      compute_time =
+          ComputeTime(device_info_, flops, num_blocks,
+                      launch_dimensions.num_threads_per_block());
+      compute_time = ConvertFPUToTensorCore(compute_time, instr);
+  }
 
   CoalescingAnalysis coalescing_analysis =
       CoalescingAnalysis::Create(instr, instr->operands(), fusion_analysis);

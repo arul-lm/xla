@@ -71,7 +71,8 @@ struct CudaComputeCapability {
     kHopper = 9,
     kBlackwell = 10,
     kBlackwell_11 = 11,
-    kBlackwell_12 = 12
+    kBlackwell_12 = 12,
+    kPassage = 13
   };
 
   constexpr CudaComputeCapability() = default;
@@ -170,9 +171,9 @@ struct CudaComputeCapability {
     return major >= CudaComputeCapabilities::kBlackwell;
   }
 
-  bool IsPascal() const { return major == CudaComputeCapabilities::kPascal; }
-
-  bool IsVolta() const { return major == CudaComputeCapabilities::kVolta; }
+  bool IsAtleastPassage() const {
+    return major >= CudaComputeCapabilities::kPassage;
+  }
 
   bool IsAmpere() const { return major == CudaComputeCapabilities::kAmpere; }
 

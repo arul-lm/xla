@@ -52,19 +52,29 @@ enum class CollectiveAlgo {
 struct CudaBandwidthSettings {
   // Table for max system bandwidths GB/s for using NCCL's low latency
   // algorithm. This is used for intra-node estimate.
-  static constexpr std::array<double, 5> kLowLatencyMaxBandwidths = {
-      39.0 /* Volta */,      87.7 /* Ampere */,    141.0 /* Hopper */,
-      141.0 /* Blackwell */, 141.0 /* next-gen */,
-  };
+  // static constexpr std::array<double, 5> kLowLatencyMaxBandwidths = {
+  //     39.0 /* Volta */,      87.7 /* Ampere */,    141.0 /* Hopper */,
+  //     141.0 /* Blackwell */, 141.0 /* next-gen */,
+  // };
 
+  static constexpr std::array<double, 6> kLowLatencyMaxBandwidths = {
+      300.0, 600.0, 900.0, 900.0, 900.0, 8000.0};
   const std::vector<double>& GetIntraNodeBandwidths() const {
     // Different tiers for intra-node bandwidth.
     static const std::vector<double>* kIntraNodeSpeeds =
-        new std::vector<double>{3.0,  4.0,  5.0,  6.0,  7.0,  9.0, 10.0,
-                                12.0, 15.0, 18.0, 20.0, 30.0, 40.0};
+        // new std::vector<double>{3.0,  4.0,  5.0,  6.0,  7.0,  9.0, 10.0,
+        //                         12.0, 15.0, 18.0, 20.0, 30.0, 40.0};
+        new std::vector<double>{100.0,  200.0,  300.0,  400.0,  500.0,
+                                600.0,  900.0,  1000.0, 2000.0, 3000.0,
+                                4000.0, 5000.0, 6000.0, 7000.0, 8000.0};
     // SM90 has different bandwidths.
-    static std::vector<double>* kIntraNodeSpeedsSm90 = new std::vector<double>{
-        3.0, 6.0, 12.0, 15.0, 20.0, 24.0, 30.0, 40.0, 60.0};
+    static std::vector<double>* kIntraNodeSpeedsSm90 =
+        // new std::vector<double>{
+        // 3.0, 6.0, 12.0, 15.0, 20.0, 24.0, 30.0, 40.0, 60.0};
+        new std::vector<double>{100.0,  200.0,  300.0,  400.0,  500.0,  600.0,
+                                700.0,  800.0,  900.0,  1000.0, 2000.0, 3000.0,
+                                4000.0, 5000.0, 6000.0, 7000.0, 8000.0};
+
     return compute_capability.major >= se::CudaComputeCapability::kHopper
                ? *kIntraNodeSpeedsSm90
                : *kIntraNodeSpeeds;
@@ -72,22 +82,26 @@ struct CudaBandwidthSettings {
 
   float GetMaxSysBwFromGpu(const double* bandwidths_table) const {
     switch (compute_capability.major) {
-      case se::CudaComputeCapability::kVolta:
+      case se::CudaComputeCapability::kPascal:
         return bandwidths_table[0];
-      case se::CudaComputeCapability::kAmpere:
+      case se::CudaComputeCapability::kVolta:
         return bandwidths_table[1];
-      case se::CudaComputeCapability::kHopper:
+      case se::CudaComputeCapability::kAmpere:
         return bandwidths_table[2];
-      case se::CudaComputeCapability::kBlackwell:
+      case se::CudaComputeCapability::kHopper:
         return bandwidths_table[3];
-      default:
+      case se::CudaComputeCapability::kBlackwell:
         return bandwidths_table[4];
+      case se::CudaComputeCapability::kPassage:
+        return bandwidths_table[5];
     }
   }
 
   // Returns NVLink bw in GB/s
   float GetNvlinkBw() const {
-    return compute_capability.IsAtLeast(se::CudaComputeCapability::kHopper)
+    return compute_capability.IsAtLeast(se::CudaComputeCapability::kPassage)
+               ? kPsgNvlinkBandwidth
+           : compute_capability.IsAtLeast(se::CudaComputeCapability::kHopper)
                ? kSm90NvlinkBandwidth
            : compute_capability.IsAtLeast(se::CudaComputeCapability::kAmpere)
                ? kSm80NvlinkBandwidth
@@ -98,29 +112,57 @@ struct CudaBandwidthSettings {
                : kSm80NvlinkBandwidth;
   }
 
+  int GetNumLinks() const {
+    switch (compute_capability.major) {
+      case se::CudaComputeCapability::kPassage:
+        return 256;
+      default:
+        return 9;
+    }
+  }
+
+  int GetScaleUpSize() const {
+    const auto max_channels = GetMaxNumChannelsRing();
+    return max_channels / 2;
+  }
+
+  float GetMaxNumChannelsRing() const {
+    switch (compute_capability.major) {
+      case se::CudaComputeCapability::kPassage:
+        return kMaxNumChannelsPsg;
+      default:
+        return kMaxNumChannelsRing;
+    }
+  }
+
   // Max bandwidth in GB/s for ring low latency 128 algorithm per channel on a
   // single-node
-  static constexpr std::array<double, 5> kPerChannelMaxRingLL128Bandwidths = {
+  static constexpr std::array<double, 6> kPerChannelMaxRingLL128Bandwidths = {
       20.0 /* Volta */,     20.0 /* Ampere */,   36.7 /* Hopper */,
-      36.7 /* Blackwell */, 36.7 /* next-gen */,
+      36.7 /* Blackwell */, 36.7 /* next-gen */, 15.625 /*Psg - 512 channels*/
   };
 
   // Nvlink unidirectional bandwidth for different compute cap. Note this is per
   // lane bandwidth.
-  static constexpr double kSm60NvlinkBandwidth = 18.0;
-  static constexpr double kSm70NvlinkBandwidth = 20.0;
-  static constexpr double kSm80NvlinkBandwidth = 20.0;
-  static constexpr double kSm90NvlinkBandwidth = 20.0;
+  // static constexpr double kSm60NvlinkBandwidth = 18.0;
+  // static constexpr double kSm70NvlinkBandwidth = 20.0;
+  // static constexpr double kSm80NvlinkBandwidth = 20.0;
+  // static constexpr double kSm90NvlinkBandwidth = 20.0;
 
+  static constexpr double kSm60NvlinkBandwidth = 37.5;
+  static constexpr double kSm70NvlinkBandwidth = 50.0;
+  static constexpr double kSm80NvlinkBandwidth = 50.0;
+  static constexpr double kSm90NvlinkBandwidth = 50.0;
+  static constexpr double kPsgNvlinkBandwidth = 15.625;
   // PCIE bandwidth for PCI Gen3 x16
-  static constexpr double kPciBandwidth = 12.0;
+  static constexpr double kPciBandwidth = 32.0;
 
   // Discount factor for ring algorithm
   static constexpr double kRingAlgorithmDiscountFactor = 0.92;
 
   // Maximum number of channels allowed by NCCL
   static constexpr int64_t kMaxNumChannelsRing = 16;
-
+  static constexpr int64_t kMaxNumChannelsPsg = 512;
   // ll128 is by default enabled for Volta, Ampere and Hopper, ll128 by default
   // launches 640 threads.
   static constexpr int64_t kLL128NumThreads = 640;
@@ -206,6 +248,11 @@ struct RocmBandwidthSettings {
     return kMi300InfinityFabricBandwidth;
   }
 
+  int GetNumLinks() const { return 4; }
+
+  static constexpr int64_t kMaxNumChannelsRing = 16;
+  float GetMaxNumChannelsRing() const { return kMaxNumChannelsRing; }
+  int GetScaleUpSize() const { return GetMaxNumChannelsRing() / 2; }
   // Infinity Fabric unidirectional bandwidth per link in GB/s
   static constexpr double kMi100InfinityFabricBandwidth = 37.5;
   static constexpr double kMi200InfinityFabricBandwidth = 75.0;
@@ -236,6 +283,8 @@ float GetMaxLowLatencyBandwidth(const BandwidthSettings& bandwidth_settings) {
   auto max_sys_bw = bandwidth_settings.GetMaxSysBwFromGpu(
       bandwidth_settings.kLowLatencyMaxBandwidths.data());
   auto it = std::lower_bound(std::begin(speeds), std::end(speeds), max_sys_bw);
+  std::cout << "LOW BANDWIDTH FOUND:" << max_sys_bw << "\t" << *it << "\n";
+  std::cout << std::flush;
   CHECK(it != std::cend(speeds));
   return *it;
 }
@@ -243,13 +292,16 @@ float GetMaxLowLatencyBandwidth(const BandwidthSettings& bandwidth_settings) {
 static constexpr absl::Duration kNcclKernelLaunchOverhead =
     absl::Microseconds(5);
 
-int64_t GetNcclMaxNumChannels(CollectiveAlgo algorithm) {
+template <typename BandwidthSettings>
+int64_t GetNcclMaxNumChannels(CollectiveAlgo algorithm,
+                              const BandwidthSettings& bandwidth_settings) {
   int64_t max_nchannels = 0;
   switch (algorithm) {
       // Tree and Ring algos share the same max channel number.
     case CollectiveAlgo::RING:
     case CollectiveAlgo::TREE:
-      max_nchannels = CudaBandwidthSettings::kMaxNumChannelsRing;
+      max_nchannels = bandwidth_settings.GetMaxNumChannelsRing();
+      // max_nchannels = CudaBandwidthSettings::kMaxNumChannelsRing;
       break;
   }
   const char* env = std::getenv("NCCL_MAX_NCHANNELS");
@@ -308,63 +360,139 @@ absl::Duration ComputeAllreduceTimeImpl(
     const HloInstruction& instr, const GpuHloCostAnalysis* cost_analysis,
     const se::DeviceDescription& gpu_device_info,
     const GpuBandwidthSettings& bandwidth_settings) {
-  // We use nccl group call to launch multiple allreduces so launch overhead
-  // only occurs once.
+
   absl::Duration total_time = kNcclKernelLaunchOverhead;
-
-  float bw_intra_node = GetMaxLowLatencyBandwidth(bandwidth_settings);
   int64_t num_devices = cost_analysis->NumOfDevices(instr);
+  auto bw_discount_factor = 0.8;
+  auto bw_intra_node = bandwidth_settings.GetNvlinkBw() * bw_discount_factor;
+  double scaleup_bw = bw_intra_node * bandwidth_settings.GetNumLinks();
+  int64_t scaleup_size = bandwidth_settings.GetScaleUpSize();
+  scaleup_size = std::min(num_devices, scaleup_size);
+  // std::cout << "Bus Bw:" << scaleup_bw << "\n";
+  // std::cout << std::flush;
 
-  int64_t min_nchannels =
-      std::max(num_devices, GetMinNumberOfChannels(CollectiveAlgo::RING));
-  int64_t num_channels =
-      std::max(min_nchannels, GetNcclMaxNumChannels(CollectiveAlgo::RING));
-  int default_threads =
-      (bw_intra_node * num_channels <= bandwidth_settings.kPciBandwidth)
-          ? 256
-          : bandwidth_settings.kLL128NumThreads;
+  auto bytes_transferred = cost_analysis->BytesTransferred(instr);
+  auto per_device_bytes = bytes_transferred / num_devices;
 
-  int warp_size = gpu_device_info.threads_per_warp();
-  int num_threads =
-      GetNumThreads(warp_size, bandwidth_settings.kLL128NumThreads / 4,
-                    bandwidth_settings.kLL128NumThreads, default_threads);
+  auto scaleout_bw = 50 * bw_discount_factor;
+  auto scaleout_size = num_devices / scaleup_size;
 
-  // Since channels are pipelined together, compute time will only occur as in a
-  // single channel.
-  absl::Duration compute_time_per_channel =
-      GpuPerformanceWithCollectiveModel::ComputeTime(
-          gpu_device_info, cost_analysis->flop_count(instr) / num_channels,
-          /*num_blocks=*/num_channels, /*num_threads_per_block=*/num_threads);
-  total_time += compute_time_per_channel;
+  auto scaleout_payload = per_device_bytes * (scaleout_size - 1);
+  auto scaleout_time =
+      absl::Milliseconds(scaleout_payload / (1e6 * scaleout_bw));
 
-  uint32_t supported_p2p =
-      GpuPerformanceWithCollectiveModel::CheckIfNvlinkSupportsP2P();
+  auto scaleup_payload = bytes_transferred / scaleup_size;
+  auto scaleup_time = absl::Milliseconds(scaleup_payload / (1e6 * scaleup_bw));
 
-  if (supported_p2p == 0) {
-    VLOG(8) << "Nvlink doesn't support p2p communication. Model will "
-               "continue using default system bandwidth.";
-  } else {
-    VLOG(8) << "Nvlink supports p2p communication, setting intra node "
-               "bandwidth to nvlink bw.";
-    bw_intra_node = bandwidth_settings.GetNvlinkBw();
-  }
+  // std::cout << "Bytes sent:" << bytes_transferred << "\n";
+  // std::cout << "Scale up bytes:" << scaleup_payload << "\n";
+  // std::cout << "Scale up dev:" << scaleup_size << "\n";
+  // std::cout << "Scale up time:" << scaleup_time << "\n";
+  // std::cout << "Scale out bytes:" << scaleout_payload << "\n";
+  // std::cout << "Scale out dev:" << scaleout_size << "\n";
+  // std::cout << "Scale out dev:" << scaleout_time << "\n";
+  // std::cout << std::flush;
 
-  double bus_bandwidth = bw_intra_node * num_channels;
+  // absl::Duration communication_time =
+  //     absl::Milliseconds(bytes_transferred / (1e6 * scaleup_bw));
 
-  // Get per channel LL128 ring bandwidth
-  double per_channel_ring_ll128_Bw =
-      GetMaxPerChannelRingLL128Bandwidth(bandwidth_settings);
-
-  bus_bandwidth =
-      std::min(bus_bandwidth * bandwidth_settings.kRingAlgorithmDiscountFactor,
-               num_channels * per_channel_ring_ll128_Bw);
-  double actual_bandwidth = bus_bandwidth * cost_analysis->ScalingRatio(instr);
-
-  absl::Duration communication_time = absl::Milliseconds(
-      cost_analysis->bytes_accessed(instr) / (1e6 * actual_bandwidth));
-  total_time += communication_time;
+  total_time += scaleup_time;
+  total_time += scaleout_time;
   return total_time;
 }
+// template <typename GpuBandwidthSettings>
+// absl::Duration ComputeAllreduceTimeImpl(
+//     const HloInstruction& instr, const GpuHloCostAnalysis* cost_analysis,
+//     const se::DeviceDescription& gpu_device_info,
+//     const GpuBandwidthSettings& bandwidth_settings) {
+//   // We use nccl group call to launch multiple allreduces so launch overhead
+//   // only occurs once.
+//   absl::Duration total_time = kNcclKernelLaunchOverhead;
+
+//   float bw_intra_node = GetMaxLowLatencyBandwidth(bandwidth_settings);
+//   // float bw_intra_node = 20;
+//   int64_t num_devices = cost_analysis->NumOfDevices(instr);
+
+//   int64_t min_nchannels =
+//       std::max(num_devices, GetMinNumberOfChannels(CollectiveAlgo::RING));
+//   // Bounds num_channels to maxNumChannels
+//   int64_t num_channels =
+//       std::max(min_nchannels,
+//                GetNcclMaxNumChannels(CollectiveAlgo::RING,
+//                bandwidth_settings));
+
+//   int default_threads =
+//       (bw_intra_node * num_channels <= bandwidth_settings.kPciBandwidth)
+//           ? 256
+//           : bandwidth_settings.kLL128NumThreads;
+
+//   int warp_size = gpu_device_info.threads_per_warp();
+//   int num_threads =
+//       GetNumThreads(warp_size, bandwidth_settings.kLL128NumThreads / 4,
+//                     bandwidth_settings.kLL128NumThreads, default_threads);
+
+//   // Since channels are pipelined together, compute time will only occur as
+//   in a
+//   // single channel.
+//   absl::Duration compute_time_per_channel =
+//       GpuPerformanceWithCollectiveModel::ComputeTime(
+//           gpu_device_info, cost_analysis->flop_count(instr) / num_channels,
+//           /*num_blocks=*/num_channels,
+//           /*num_threads_per_block=*/num_threads);
+//   total_time += compute_time_per_channel;
+
+//   // uint32_t supported_p2p =
+//   //     GpuPerformanceWithCollectiveModel::CheckIfNvlinkSupportsP2P();
+
+//   uint32_t supported_p2p = 1;
+//   if (supported_p2p == 0) {
+//     VLOG(8) << "Nvlink doesn't support p2p communication. Model will "
+//                "continue using default system bandwidth.";
+//   } else {
+//     VLOG(8) << "Nvlink supports p2p communication, setting intra node "
+//                "bandwidth to nvlink bw.";
+//     bw_intra_node = bandwidth_settings.GetNvlinkBw();
+//   }
+
+//   double bus_bandwidth = bw_intra_node * num_channels;
+
+//   // Get per channel LL128 ring bandwidth
+//   double per_channel_ring_ll128_Bw =
+//       GetMaxPerChannelRingLL128Bandwidth(bandwidth_settings);
+
+//   std::cout << "BusBW Before:" << bus_bandwidth * 0.92 << "|\t" <<
+//   num_channels
+//             << "|\t" << per_channel_ring_ll128_Bw << "|\t"
+//             << bandwidth_settings.kRingAlgorithmDiscountFactor << "\n";
+//   bus_bandwidth =
+//       std::min(bus_bandwidth *
+//       bandwidth_settings.kRingAlgorithmDiscountFactor,
+//                num_channels * per_channel_ring_ll128_Bw);
+
+//   // auto scaling_ratio = cost_analysis->ScalingRatio(instr);
+//   float scaling_ratio = 1.0;
+
+//   if (min_nchannels > num_channels) {
+//     scaling_ratio = num_channels / (1.0 * min_nchannels);
+//   }
+//   std::cout << "MIN CHAN:\t" << num_devices << "\t" << min_nchannels << "|"
+//   << num_channels << "\n"; double actual_bandwidth = bus_bandwidth *
+//   scaling_ratio; auto bytes_transferred =
+//   cost_analysis->BytesTransferred(instr);
+
+//   auto bytes_accessed = cost_analysis->bytes_accessed();
+//   absl::Duration communication_time =
+//       absl::Milliseconds(bytes_transferred / (1e6 * actual_bandwidth));
+
+//   std::cout << "BusBW:" << bus_bandwidth << "|\t" << num_channels << "|\t"
+//             << scaling_ratio << "\t" << bytes_transferred << "\t"
+//             << actual_bandwidth << "\t" << communication_time << "\n";
+//   std::cout << std::flush;
+
+//   total_time += communication_time;
+
+//   return total_time;
+// }
 
 CudaBandwidthSettings CreateSettings(
     const stream_executor::CudaComputeCapability& cc) {
@@ -488,6 +616,9 @@ GpuPerformanceWithCollectiveModel::ComputeCollectiveTime(
     return absl::ZeroDuration();
   }
   switch (instr.opcode()) {
+  case xla::HloOpcode::kReduceScatter:
+    case HloOpcode::kCollectivePermute:
+    case HloOpcode::kAllGather:
     case HloOpcode::kAllReduce:
     case HloOpcode::kAllReduceStart:
       return ComputeAllreduceTime(instr, cost_analysis, gpu_device_info);

@@ -39,8 +39,6 @@ limitations under the License.
 #include "xla/tsl/platform/status.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include <algorithm>
-#include <iostream>
 
 namespace xla {
 namespace gpu {
@@ -151,17 +149,17 @@ EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(
   int64_t num_blocks = launch_dimensions.num_blocks();
 
   absl::Duration compute_time;
-  compute_time = GpuPerformanceModelBase::ComputeTime(
-      device_info_, flops, num_blocks,
-      launch_dimensions.num_threads_per_block());
-  if (!IsTpuDevice(device_info_)) {
-    compute_time = compute_time * 1.0;
-    // TPU uses peak TFLOPS
+  if(IsTpuDevice(device_info_)){
+      compute_time = ComputeTpuTime(device_info_, flops, num_blocks, launch_dimensions.num_threads_per_block());
   } else {
+      compute_time =
+          ComputeTime(device_info_, flops, num_blocks,
+                      launch_dimensions.num_threads_per_block());
       compute_time = ConvertFPUToTensorCore(compute_time, instr);
   }
-  CoalescingAnalysis coalescing_analysis(instr, instr->operands(),
-                                         fusion_analysis);
+
+  CoalescingAnalysis coalescing_analysis =
+      CoalescingAnalysis::Create(instr, instr->operands(), fusion_analysis);
 
   absl::Duration read_time;
   int64_t bytes_read = 0;

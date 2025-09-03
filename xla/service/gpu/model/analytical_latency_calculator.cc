@@ -1016,8 +1016,16 @@ int main(int argc, char* argv[]) {
     auto device_name = pair.first;
     stream_executor::GpuDeviceInfoProto gpu_device_info_pb = pair.second.first;
     std::string spec_file_name = pair.second.second;
-    auto gpu_device_info =
-        stream_executor::DeviceDescription(gpu_device_info_pb);
+    absl::StatusOr<stream_executor::DeviceDescription> gpu_device_info_result =
+        stream_executor::DeviceDescription::FromProto(gpu_device_info_pb);
+
+    if (!gpu_device_info_result.ok()) {
+      llvm::outs() << "Failed to create DeviceDescription: " << device_name << "\n";
+      llvm::outs().flush();
+      return -1;
+    }
+
+    stream_executor::DeviceDescription gpu_device_info = gpu_device_info_result.value();
     // uint64_t memory_limit = xla::gpu::GetSchedulerMemoryLimit(
     //     *hlo_module, gpu_device_info, pointer_size);
     // std::cout << "Mem validation passed. Memory limit(in GB):"
@@ -1115,7 +1123,7 @@ int main(int argc, char* argv[]) {
 
             // FIXME: Runtime_data will be outdated
             runtime_data =
-                gpu_performance_model_.EstimateRunTimeForInstruction(
+                gpu_performance_model_.Get().EstimateRunTimeForInstruction(
                     instr, &*ale_cost_analysis);
 
             // Add computation statistics to CSV data for all computations
@@ -1195,7 +1203,7 @@ int main(int argc, char* argv[]) {
             break;
           }
           case xla::HloOpcode::kDot: {
-            runtime_data = gpu_performance_model_.EstimateRunTimeForInstruction(
+              runtime_data = gpu_performance_model_.Get().EstimateRunTimeForInstruction(
                 instr, &*ale_cost_analysis);
 
             cost = absl::ToDoubleMicroseconds(runtime_data.exec_time);

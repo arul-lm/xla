@@ -121,7 +121,7 @@ CommType DetermineCommType(const std::vector<int64_t>& device_ids, uint64_t repl
 uint64_t GetNumReplicaGroups(const xla::HloInstruction* instr);
 uint64_t GetReplicaGroupSize(const xla::HloInstruction* instr);
 std::string GetDataTypeFromInstruction(const xla::HloInstruction* instr);
-bool IsTpuDevice(const stream_executor::DeviceDescription& device_info);
+bool IsTpuDevice(const std::string& hardware_arch);
 
 
 
@@ -133,15 +133,20 @@ void ValidateIntraNodeConfig(const IntraNodeConfig& config) {
   CHECK_LE(config.efficiency_factor, 1.0) << "intranode_config.efficiency_factor must be less than or equal to 1.0, got: " << config.efficiency_factor;
 }
 
-// Helper function to determine intra-node size and bandwidth based on device type and compute capability
+// Helper function to determine intra-node size and bandwidth based on hardware architecture
 IntraNodeConfig GetIntraNodeConfigFromDeviceInfo(const stream_executor::DeviceDescription& gpu_device_info,
+                                                 const std::string& hardware_architecture,
                                                  const std::string& fallback_device_type = "") {
-  // Extract device name and compute capability
-  std::string device_name = gpu_device_info.name();
+  // Use hardware architecture name for device configuration lookup
+  std::string device_name = hardware_architecture;
 
-  // Handle undefined device names
-  if (device_name == "<undefined>" || device_name.empty()) {
-    device_name = fallback_device_type;
+  // Handle empty hardware architecture by falling back to device description
+  if (device_name.empty()) {
+    device_name = gpu_device_info.name();
+    // Handle undefined device names
+    if (device_name == "<undefined>" || device_name.empty()) {
+      device_name = fallback_device_type;
+    }
   }
 
   // Search for exact device configuration match (case-insensitive)
@@ -154,7 +159,7 @@ IntraNodeConfig GetIntraNodeConfigFromDeviceInfo(const stream_executor::DeviceDe
   }
 
   // Debug: Print available device patterns for troubleshooting
-  llvm::outs() << "DEBUG: Device name '" << device_name << "' not found in device_configs.\n";
+  llvm::outs() << "DEBUG: Hardware architecture '" << device_name << "' not found in device_configs.\n";
   llvm::outs() << "DEBUG: Available device patterns (exact match required):\n";
   for (const auto& config : device_configs) {
     llvm::outs() << "  - '" << config.name_pattern << "'\n";
@@ -162,7 +167,7 @@ IntraNodeConfig GetIntraNodeConfigFromDeviceInfo(const stream_executor::DeviceDe
   llvm::outs().flush();
 
   // Fail with error if no exact device configuration match is found
-  CHECK(false) << "No exact device configuration match found for device: '" << device_name
+  CHECK(false) << "No exact device configuration match found for hardware architecture: '" << device_name
                << "'. Please add support for this device type in GetIntraNodeConfigFromDeviceInfo function.";
 }
 
@@ -171,10 +176,11 @@ CommCostStats CalculateCommCost(double per_device_comm_volume,
                                const stream_executor::DeviceDescription& gpu_device_info,
                                const xla::HloInstruction* instr, uint64_t replica_group_size,
                                uint64_t num_replica_groups,
+                               const std::string& hardware_architecture,
                                const std::string& fallback_device_type = "",
                                double non_overlap_factor = 1.0) {
   // Get device-specific configuration (already validated in GetIntraNodeConfigFromDeviceInfo)
-  IntraNodeConfig intranode_config = GetIntraNodeConfigFromDeviceInfo(gpu_device_info, fallback_device_type);
+  IntraNodeConfig intranode_config = GetIntraNodeConfigFromDeviceInfo(gpu_device_info, hardware_architecture, fallback_device_type);
 
   // Validate per_device_comm_volume
   CHECK_GE(per_device_comm_volume, 0.0) << "per_device_comm_volume must be greater than 0.0, got: " << per_device_comm_volume;
@@ -257,64 +263,15 @@ CommCostStats CalculateCommCost(double per_device_comm_volume,
   };
 }
 
-// Helper function to convert device ID to 3D coordinates in torus
-std::tuple<int, int, int> DeviceIdTo3DCoords(int64_t device_id, const std::vector<int>& mesh_shape) {
-  CHECK_EQ(mesh_shape.size(), 3) << "Mesh shape must be 3D for TPU torus";
-  int x_size = mesh_shape[0];
-  int y_size = mesh_shape[1];
-  int z_size = mesh_shape[2];
-
-  int z = device_id % z_size;
-  int y = (device_id / z_size) % y_size;
-  int x = device_id / (y_size * z_size);
-
-  return {x, y, z};
-}
-
-// Helper function to calculate Manhattan distance in 3D torus
-int Calculate3DTorusDistance(int x1, int y1, int z1, int x2, int y2, int z2,
-                            const std::vector<int>& mesh_shape) {
-  int x_size = mesh_shape[0];
-  int y_size = mesh_shape[1];
-  int z_size = mesh_shape[2];
-
-  // Calculate distance in each dimension considering torus wraparound
-  int dx = std::min(std::abs(x2 - x1), std::min(std::abs(x2 - x1 + x_size), std::abs(x2 - x1 - x_size)));
-  int dy = std::min(std::abs(y2 - y1), std::min(std::abs(y2 - y1 + y_size), std::abs(y2 - y1 - y_size)));
-  int dz = std::min(std::abs(z2 - z1), std::min(std::abs(z2 - z1 + z_size), std::abs(z2 - z1 - z_size)));
-
-  return dx + dy + dz;
-}
-
-// Helper function to calculate maximum distance between devices in replica group
-int CalculateMaxDistanceInReplicaGroup(const std::vector<int64_t>& device_ids,
-                                      const std::vector<int>& mesh_shape) {
-  int max_distance = 0;
-
-  for (size_t i = 0; i < device_ids.size(); ++i) {
-    for (size_t j = i + 1; j < device_ids.size(); ++j) {
-      auto [x1, y1, z1] = DeviceIdTo3DCoords(device_ids[i], mesh_shape);
-      auto [x2, y2, z2] = DeviceIdTo3DCoords(device_ids[j], mesh_shape);
-
-      int distance = Calculate3DTorusDistance(x1, y1, z1, x2, y2, z2, mesh_shape);
-      max_distance = std::max(max_distance, distance);
-    }
+int CalculateMaxHop(const std::vector<int64_t>& device_ids, const std::vector<int>& mesh_shape) {
+  int max_hop = 0;
+  // Go through each dim in the mesh
+  for (int i = 0; i < mesh_shape.size(); ++i) {
+    max_hop += mesh_shape[i] / 2;
   }
-
-  return max_distance;
-}
-
-// Helper function to estimate number of hops for all-reduce in 3D torus
-int EstimateAllReduceHops(int replica_group_size, int max_distance, const std::vector<int>& mesh_shape) {
-  // For all-reduce in 3D torus, we need to consider:
-  // 1. Reduce-scatter phase: log2(replica_group_size) steps
-  // 2. All-gather phase: log2(replica_group_size) steps
-  // 3. Each step involves communication across max_distance
-
-  int reduce_scatter_hops = static_cast<int>(std::log2(replica_group_size)) * max_distance;
-  int all_gather_hops = static_cast<int>(std::log2(replica_group_size)) * max_distance;
-
-  return reduce_scatter_hops + all_gather_hops;
+  llvm::outs() << "Max hop:" << max_hop << "\n";
+  llvm::outs().flush();
+  return max_hop;
 }
 
 // Function to calculate TPU communication cost based on 3D torus topology
@@ -324,6 +281,7 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
                                    uint64_t num_replica_groups,
                                    const std::vector<int64_t>& device_ids,
                                    const std::vector<int>& mesh_shape,
+                                   const std::string& hardware_architecture,
                                    const std::string& fallback_device_type = "",
                                    double non_overlap_factor = 1.0) {
   // Validate inputs
@@ -334,15 +292,14 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
   CHECK_EQ(device_ids.size(), replica_group_size) << "Device IDs size must match replica group size";
 
   // Get device-specific ICI bandwidth from device configuration
-  IntraNodeConfig intranode_config = GetIntraNodeConfigFromDeviceInfo(tpu_device_info, fallback_device_type);
+  IntraNodeConfig intranode_config = GetIntraNodeConfigFromDeviceInfo(tpu_device_info, hardware_architecture, fallback_device_type);
 
-  // Get the device configuration to access links_per_chip
-  std::string device_name = tpu_device_info.name();
+  // Get the device configuration to access links_per_chip using hardware architecture
   int links_per_chip = 6;  // Default for TPU v4
 
-  // Find the device configuration to get links_per_chip
+  // Find the device configuration to get links_per_chip using hardware architecture
   for (const auto& config : device_configs) {
-    if (absl::StrContains(absl::AsciiStrToLower(device_name), absl::AsciiStrToLower(config.name_pattern))) {
+    if (absl::StrContains(absl::AsciiStrToLower(hardware_architecture), absl::AsciiStrToLower(config.name_pattern))) {
       links_per_chip = config.links_per_chip;
       break;
     }
@@ -350,14 +307,12 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
 
   // Calculate ICI bandwidth per hop (per link)
   // per-link bandwidth = total_bandwidth / (links_per_chip * num_chips)
-  double ici_bandwidth_per_link_gbps = intranode_config.bandwidth_gbps / (links_per_chip * 64.0);
+  double ici_bandwidth_per_link_gbps = intranode_config.bandwidth_gbps / (links_per_chip * intranode_config.size);
 
 
   // Calculate maximum distance between two neighbors in the replica group
-  int max_distance = CalculateMaxDistanceInReplicaGroup(device_ids, mesh_shape);
-
-  // Calculate number of hops to reach the neighbor at max_distance
-  int number_of_hops = max_distance;  // Direct hop count to reach the neighbor
+  // Temporarily set to 1 for testing
+  int number_of_hops = 1; // CalculateMaxHop(device_ids, mesh_shape);
 
   // Calculate communication volume per device in GB
   double per_device_comm_vol_gb = per_device_comm_volume / (1024.0 * 1024.0 * 1024.0);
@@ -382,7 +337,6 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
     llvm::outs() << "WARNING: NaN detected in CalculateTpuCommCost for instruction: " << instr->ToString() << "\n";
     llvm::outs() << "  per_device_comm_volume: " << per_device_comm_volume << "\n";
     llvm::outs() << "  replica_group_size: " << replica_group_size << "\n";
-    llvm::outs() << "  max_distance: " << max_distance << "\n";
     llvm::outs() << "  links_per_chip: " << links_per_chip << "\n";
     llvm::outs() << "  number_of_hops: " << number_of_hops << "\n";
     llvm::outs() << "  ici_bandwidth_per_link_gbps: " << ici_bandwidth_per_link_gbps << "\n";
@@ -405,6 +359,8 @@ struct CliOpts {
   std::string hlo_module_file;
   std::string comm_non_overlap = "1.0";
   std::vector<std::string> hardware_architectures;
+  std::string output_dir = "stats";
+  std::string mesh_shape = "4,4,4";
 };
 
 void writeCsv(std::ofstream& outputFile,
@@ -715,10 +671,9 @@ uint64_t GetDeviceCount(const xla::HloInstruction* instr) {
 }
 
 // Helper function to detect if device is TPU
-bool IsTpuDevice(const stream_executor::DeviceDescription& device_info) {
-  std::string name = device_info.name();
-  std::string lower_name = absl::AsciiStrToLower(name);
-  return absl::StrContains(lower_name, "tpu");
+bool IsTpuDevice(const std::string& hardware_arch) {
+  std::string lower_arch = absl::AsciiStrToLower(hardware_arch);
+  return absl::StrContains(lower_arch, "tpu");
 }
 
 // Helper function to get data type from instruction result shape
@@ -918,7 +873,9 @@ int main(int argc, char* argv[]) {
   std::vector<tsl::Flag> flag_list = {
       tsl::Flag("hlo-module-file", &opts.hlo_module_file, "Filename of HloModule"),
       tsl::Flag("comm-non-overlap", &opts.comm_non_overlap, "Communication non-overlap factor (0.0 to 1.0)"),
-      tsl::Flag("hardware-architectures", &hardware_architectures_str, "Comma-separated list of hardware architectures (e.g., h100_pcie,tpuv5p,tpuv6e)")};
+      tsl::Flag("hardware-architectures", &hardware_architectures_str, "Comma-separated list of hardware architectures (e.g., h100_pcie,tpuv5p,tpuv6e)"),
+      tsl::Flag("output-dir", &opts.output_dir, "Output directory for CSV files (default: stats)"),
+      tsl::Flag("mesh-shape", &opts.mesh_shape, "3D mesh shape for TPU communication (e.g., 4,4,4)")};
   xla::AppendDebugOptionsFlags(&flag_list);
   std::string usage_string = tsl::Flags::Usage(argv[0], flag_list);
   if (!tsl::Flags::Parse(&argc, argv, flag_list)) {
@@ -935,6 +892,49 @@ int main(int argc, char* argv[]) {
         opts.hardware_architectures.push_back(arch);
       }
     }
+  }
+
+  // Parse mesh_shape from comma-separated string
+  std::vector<int> mesh_shape;
+  if (!opts.mesh_shape.empty()) {
+    std::vector<absl::string_view> mesh_parts = absl::StrSplit(opts.mesh_shape, ',');
+    for (const absl::string_view& part : mesh_parts) {
+      absl::string_view trimmed_part = absl::StripAsciiWhitespace(part);
+      if (!trimmed_part.empty()) {
+        // Check if string contains only digits (and optional leading sign)
+        bool is_valid = !trimmed_part.empty();
+        if (is_valid) {
+          size_t start = 0;
+          if (trimmed_part[0] == '-' || trimmed_part[0] == '+') {
+            start = 1;
+          }
+          for (size_t i = start; i < trimmed_part.length(); ++i) {
+            if (!std::isdigit(trimmed_part[i])) {
+              is_valid = false;
+              break;
+            }
+          }
+        }
+
+        if (!is_valid) {
+          llvm::outs() << "Error: Invalid mesh shape value: " << trimmed_part << "\n";
+          return 1;
+        }
+
+        int value = std::stoi(std::string(trimmed_part));
+        if (value <= 0) {
+          llvm::outs() << "Error: Mesh shape values must be positive integers, got: " << value << "\n";
+          return 1;
+        }
+        mesh_shape.push_back(value);
+      }
+    }
+  }
+
+  // Validate mesh_shape
+  if (mesh_shape.size() != 3) {
+    llvm::outs() << "Error: Mesh shape must have exactly 3 dimensions, got: " << mesh_shape.size() << "\n";
+    return 1;
   }
   tsl::port::InitMain(usage_string.c_str(), &argc, &argv);
   CHECK(opts.hlo_module_file.empty() == false)
@@ -960,20 +960,26 @@ int main(int argc, char* argv[]) {
     llvm::outs() << opts.hardware_architectures[i];
   }
   llvm::outs() << "\n";
+  llvm::outs() << "Using output directory: " << opts.output_dir << "\n";
+  llvm::outs() << "Using mesh shape: " << mesh_shape[0] << "x" << mesh_shape[1] << "x" << mesh_shape[2] << "\n";
   llvm::outs().flush();
 
   std::string prefix = "/xla";
-  auto stats_path = tsl::io::JoinPath("/xla", "stats");
+  auto output_path = tsl::io::JoinPath("/xla", opts.output_dir);
+  // Create output directory if it doesn't exist
+  if (!tsl::Env::Default()->FileExists(output_path).ok()) {
+    tsl::Env::Default()->CreateDir(output_path);
+  }
   std::ofstream device_stats_csv =
-      createCsv(tsl::io::JoinPath(stats_path, "device_stats.csv"));
-  auto comp_stats_csv = createCsv(tsl::io::JoinPath(stats_path, "comp_stats.csv"));
-  auto comm_stats_csv = createCsv(tsl::io::JoinPath(stats_path, "comm_stats.csv"));
+      createCsv(tsl::io::JoinPath(output_path, "device_stats.csv"));
+  auto comp_stats_csv = createCsv(tsl::io::JoinPath(output_path, "comp_stats.csv"));
+  auto comm_stats_csv = createCsv(tsl::io::JoinPath(output_path, "comm_stats.csv"));
   if (!device_stats_csv.is_open() || !comp_stats_csv.is_open() || !comm_stats_csv.is_open()) {
     return -1;
   }
 
   std::vector<std::vector<std::string>> device_stats_data, comp_stats_data, comm_stats_data;
-  std::vector<std::string> device_stats_header = {"device_name", "latency"};
+  std::vector<std::string> device_stats_header = {"device_name", "latency", "compute_time", "comm_time"};
   std::vector<std::string> comp_stats_header = {
       "comp_id",   "idx",       "inst",       "group",         "latency(µs)",
       "tflops",    "bytes_read_gb", "bytes_written_gb", "compute_time",
@@ -1156,14 +1162,13 @@ int main(int argc, char* argv[]) {
 
             // Dispatch to appropriate communication cost calculation based on device type
             CommCostStats comm_stats;
-            if (IsTpuDevice(gpu_device_info)) {
+            if (IsTpuDevice(spec_file_name)) {
               // Get device IDs and mesh shape for TPU communication cost calculation
               auto device_ids = GetDeviceIdsFromOneReplicaGroup(instr);
-              // Default TPU v4 pod slice mesh shape: 4x4x4
-              std::vector<int> mesh_shape = {4, 4, 4};
-              comm_stats = CalculateTpuCommCost(comm_volume.per_device_volume, gpu_device_info, instr, replica_group_size, num_replica_groups, device_ids, mesh_shape, spec_file_name, comm_non_overlap_value);
+              // Use mesh shape from command line argument
+              comm_stats = CalculateTpuCommCost(comm_volume.per_device_volume, gpu_device_info, instr, replica_group_size, num_replica_groups, device_ids, mesh_shape, spec_file_name, "", comm_non_overlap_value);
             } else {
-              comm_stats = CalculateCommCost(comm_volume.per_device_volume, gpu_device_info, instr, replica_group_size, num_replica_groups, spec_file_name, comm_non_overlap_value);
+              comm_stats = CalculateCommCost(comm_volume.per_device_volume, gpu_device_info, instr, replica_group_size, num_replica_groups, spec_file_name, "", comm_non_overlap_value);
             }
             cost = comm_stats.comm_cost_us;
 
@@ -1265,8 +1270,11 @@ int main(int argc, char* argv[]) {
 
     // Use entry computation cost for device_stats
     auto entry_comp_cost_in_secs = entry_comp_cost / 1e6;
+    auto entry_compute_time_in_secs = entry_compute_time / 1e6;
+    auto entry_comm_time_in_secs = entry_comm_time / 1e6;
     device_stats_data.push_back(
-        {device_name, std::to_string(entry_comp_cost_in_secs)});
+        {device_name, std::to_string(entry_comp_cost_in_secs),
+         std::to_string(entry_compute_time_in_secs), std::to_string(entry_comm_time_in_secs)});
     llvm::outs().flush();
   }
   writeCsv(device_stats_csv, device_stats_data);
@@ -1275,9 +1283,9 @@ int main(int argc, char* argv[]) {
   device_stats_csv.close();
   comp_stats_csv.close();
   comm_stats_csv.close();
-  llvm::outs() << "CSV files saved to: " << tsl::io::JoinPath(stats_path, "device_stats.csv")
-               << ", " << tsl::io::JoinPath(stats_path, "comp_stats.csv")
-               << ", " << tsl::io::JoinPath(stats_path, "comm_stats.csv") << "\n";
+  llvm::outs() << "CSV files saved to: " << tsl::io::JoinPath(output_path, "device_stats.csv")
+               << ", " << tsl::io::JoinPath(output_path, "comp_stats.csv")
+               << ", " << tsl::io::JoinPath(output_path, "comm_stats.csv") << "\n";
   llvm::outs() << "Done\n";
   return 0;
 }

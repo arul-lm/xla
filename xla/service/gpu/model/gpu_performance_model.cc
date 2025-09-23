@@ -113,7 +113,7 @@ absl::Duration ConvertFPUToTensorCore(absl::Duration compute_time,
 }
 
 bool IsTpuDevice(const stream_executor::DeviceDescription& device_info) {
-  std::string name = device_info.name();
+  auto name = device_info.name();
   std::string lower_name = absl::AsciiStrToLower(name);
   return absl::StrContains(lower_name, "tpu");
 }
@@ -123,17 +123,27 @@ absl::Duration ComputeTpuTime(
     int64_t num_blocks, int64_t num_threads_per_block) {
   // For TPU: num_threads_per_block = MXU size (128x128 = 16384)
   // num_blocks = number of MXUs
-    int64_t n_active_mxus = num_blocks;
-    int64_t n_active_elements_per_mxu = num_threads_per_block;
+  //   int64_t n_active_mxus = num_blocks;
+  //   int64_t n_active_elements_per_mxu = num_threads_per_block;
 
-  int64_t total_active_elements = n_active_mxus * n_active_elements_per_mxu;
+  // int64_t total_active_elements = n_active_mxus * n_active_elements_per_mxu;
 
-  // Each element performs 2 FLOPS (multiply + add)
-  int64_t flops_per_ns_per_element = tpu_device_info.clock_rate_ghz() * 2;
-  int64_t effective_flops_per_ns =
-      flops_per_ns_per_element * total_active_elements;
-
-  return absl::Nanoseconds(1.0f * flops / effective_flops_per_ns);
+  // // Each element performs 2 FLOPS (multiply + add)
+  // int64_t flops_per_ns_per_element = tpu_device_info.clock_rate_ghz() * 2;
+  // int64_t effective_flops_per_ns =
+  //     flops_per_ns_per_element * total_active_elements;
+  // std::cout << "FLOPS:" << flops << "\n";
+  // std::cout << "FPNE:" << effective_flops_per_ns << "\n";
+    int64_t n_active_fpus_per_core = tpu_device_info.fpus_per_core();
+    int64_t n_active_core = tpu_device_info.core_count();
+    int64_t fpu_count = n_active_core * n_active_fpus_per_core;
+    double flop_per_ns_per_fpu = tpu_device_info.clock_rate_ghz() * /*fma:*/ 2;
+    auto flop_per_ns = flop_per_ns_per_fpu * fpu_count;
+    // std::cout << "active_fpus_per_core:" << n_active_fpus_per_core << "\n";
+    // std::cout << "active_core:" << n_active_core << "\n";
+    // std::cout << "fpu_count:" << fpu_count << "\n";
+    // std::cout << "flop_per_ns" << flop_per_ns << "\n";
+  return absl::Nanoseconds(1.0f * flops / flop_per_ns);
 }
 
 EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(

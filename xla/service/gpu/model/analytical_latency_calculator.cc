@@ -38,7 +38,7 @@
 #include "absl/status/statusor.h"
 #include "absl/status/status.h"
 #include "tsl/platform/logging.h"
-
+#include <cmath>
 
 
 // Communication type enum for node-level analysis
@@ -113,6 +113,8 @@ struct CommCostStats {
   double intranode_comm_bw_gbps;  // Intra-node communication bandwidth in GB/s
   double internode_comm_bw_gbps;  // Inter-node communication bandwidth in GB/s
   double total_comm_vol_gb;       // Total communication volume in GB (sum of intranode and internode)
+  int num_hops;              // Number of hops for communication
+  double per_link_cost_us;   // Cost per link in microseconds
 };
 
 // Forward declarations
@@ -208,7 +210,6 @@ CommCostStats CalculateCommCost(double per_device_comm_volume,
     }
     intranode_comm_vol_gb = per_device_comm_vol_gb;
     comm_cost_us += intranode_comm_vol_gb / intranode_comm_bw_gbps * 1e6;
-
   } else if (comm_type == CommType::Hierarchical) {
     // Hierarchical happens because within a replica group, there are devices that go beyond the intranode_config.size
     // assert that replica_group_size is divisible by intranode_config.size
@@ -229,8 +230,27 @@ CommCostStats CalculateCommCost(double per_device_comm_volume,
   // Calculate total communication volume
   double total_comm_vol_gb = intranode_comm_vol_gb + internode_comm_vol_gb;
 
+  // Calculate number of hops and per-link cost for GPU communication
+  int num_hops = 1;  // Default to 1 hop for GPU communication
+  double per_link_cost_us = 0.0;
+
+  if (comm_type == CommType::IntraNode) {
+    // For intra-node communication, assume 1 hop through NVLink/PCIe
+    num_hops = 1;
+    per_link_cost_us = comm_cost_us / num_hops;
+  } else if (comm_type == CommType::InterNode) {
+    // For inter-node communication, assume multiple hops through network
+    num_hops = 2;  // Conservative estimate for network hops
+    per_link_cost_us = comm_cost_us / num_hops;
+  } else if (comm_type == CommType::Hierarchical) {
+    // For hierarchical communication, combine intra and inter-node hops
+    num_hops = 3;  // 1 for intra-node + 2 for inter-node
+    per_link_cost_us = comm_cost_us / num_hops;
+  }
+
   // Apply non_overlap factor to communication cost
   comm_cost_us *= non_overlap_factor;
+  per_link_cost_us *= non_overlap_factor;
 
   // Debug logging to catch any remaining NaN values
   if (std::isnan(comm_cost_us) || std::isnan(intranode_comm_vol_gb) || std::isnan(internode_comm_vol_gb) ||
@@ -259,19 +279,46 @@ CommCostStats CalculateCommCost(double per_device_comm_volume,
     internode_comm_vol_gb,
     intranode_comm_bw_gbps,
     internode_comm_bw_gbps,
-    total_comm_vol_gb
+    total_comm_vol_gb,
+    num_hops,
+    per_link_cost_us
   };
 }
 
 int CalculateMaxHop(const std::vector<int64_t>& device_ids, const std::vector<int>& mesh_shape) {
-  int max_hop = 0;
+  float max_hop = 0;
   // Go through each dim in the mesh
   for (int i = 0; i < mesh_shape.size(); ++i) {
-    max_hop += mesh_shape[i] / 2;
+      max_hop += mesh_shape[i] / 4.0;
   }
-  llvm::outs() << "Max hop:" << max_hop << "\n";
-  llvm::outs().flush();
+
   return max_hop;
+}
+
+int CalculateAverageHops(const std::vector<int>& mesh_shape) {
+    double avg_hops = 0.0;
+    for (int dim_size : mesh_shape) {
+        avg_hops += dim_size / 4.0;
+    }
+    return static_cast<int>(std::ceil(avg_hops));
+}
+
+int CalculateHopsFromDeviceIds(const std::vector<int64_t>& device_ids, const std::vector<int>& mesh_shape) {
+  // Assume every device communicates to the right.
+  // Find the distance between the first and second device.
+  // if second device does not exist, then hop_distance = 1
+  // if second device exists, then hop_distance = distance between the first and second device
+  // convert first device id to 3D coordinates
+  int x = device_ids[0] / (mesh_shape[0] * mesh_shape[1]);
+  int y = (device_ids[0] % (mesh_shape[0] * mesh_shape[1])) / mesh_shape[1];
+  int z = device_ids[0] % mesh_shape[1];
+  // convert second device id to 3D coordinates
+  int x2 = device_ids[1] / (mesh_shape[0] * mesh_shape[1]);
+  int y2 = (device_ids[1] % (mesh_shape[0] * mesh_shape[1])) / mesh_shape[1];
+  int z2 = device_ids[1] % mesh_shape[1];
+  // calculate the distance between the first and second device
+  int hop_distance = std::abs(x - x2) + std::abs(y - y2) + std::abs(z - z2);
+  return hop_distance;
 }
 
 // Function to calculate TPU communication cost based on 3D torus topology
@@ -307,22 +354,22 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
 
   // Calculate ICI bandwidth per hop (per link)
   // per-link bandwidth = total_bandwidth / (links_per_chip * num_chips)
-  double ici_bandwidth_per_link_gbps = intranode_config.bandwidth_gbps / (links_per_chip * intranode_config.size);
+  double ici_bandwidth_per_link_gbps = (intranode_config.bandwidth_gbps * intranode_config.efficiency_factor) / (links_per_chip * intranode_config.size);
 
 
   // Calculate maximum distance between two neighbors in the replica group
-  // Temporarily set to 1 for testing
-  int number_of_hops = 1; // CalculateMaxHop(device_ids, mesh_shape);
-
+  // int number_of_hops = CalculateMaxHop(device_ids, mesh_shape);
+  int number_of_hops = CalculateHopsFromDeviceIds(device_ids, mesh_shape);
   // Calculate communication volume per device in GB
   double per_device_comm_vol_gb = per_device_comm_volume / (1024.0 * 1024.0 * 1024.0);
 
   // Calculate communication cost using the formula:
-  // cost = (per_device_comm_gb / send_link_bw) * number_of_hops
-  double comm_cost_us = (per_device_comm_vol_gb / ici_bandwidth_per_link_gbps) * number_of_hops * 1e6;
+  double per_link_cost_us = (per_device_comm_vol_gb / ici_bandwidth_per_link_gbps) * 1e6;
+  double comm_cost_us = per_link_cost_us * number_of_hops;
 
   // Apply non_overlap factor
   comm_cost_us *= non_overlap_factor;
+  per_link_cost_us *= non_overlap_factor;
 
   // For TPU, all communication is intra-pod (within the 3D torus)
   double intranode_comm_vol_gb = per_device_comm_vol_gb;
@@ -351,7 +398,9 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
     internode_comm_vol_gb,
     ici_bandwidth_per_link_gbps,  // intranode_comm_bw_gbps
     0.0,                          // internode_comm_bw_gbps (not used for TPU)
-    total_comm_vol_gb
+    total_comm_vol_gb,
+    number_of_hops,
+    per_link_cost_us
   };
 }
 
@@ -774,6 +823,8 @@ void AddCompStatsToCSV(std::vector<std::vector<std::string>>& comp_stats_data,
 struct CommunicationVolume {
   double per_device_volume;
   double total_volume;
+  double operand_size;
+  double result_size;
   std::string pattern;
   std::string formula;
 };
@@ -781,7 +832,8 @@ struct CommunicationVolume {
 // Helper function to calculate ring-based communication volume
 CommunicationVolume CalculateRingVolume(double per_step_data, uint64_t replica_group_size,
                                        const std::string& operation_name,
-                                       const std::string& formula, double multiplier = 1.0) {
+                                       const std::string& formula, double multiplier = 1.0,
+                                       double operand_size = 0.0, double result_size = 0.0) {
   double total_steps = replica_group_size - 1;
   double per_device_volume = per_step_data * total_steps;
   double total_volume = per_device_volume * replica_group_size;
@@ -789,6 +841,8 @@ CommunicationVolume CalculateRingVolume(double per_step_data, uint64_t replica_g
   return {
     per_device_volume * multiplier,
     total_volume * multiplier,
+    operand_size,
+    result_size,
     "Ring-based " + operation_name,
     formula
   };
@@ -809,7 +863,7 @@ CommunicationVolume CalculateCommunicationVolume(const xla::HloInstruction* inst
 
         double per_step_data = operand_size / replica_group_size;
         std::string formula = "operand_size/" + std::to_string(replica_group_size) + " * (" + std::to_string(replica_group_size) + "-1)";
-        CommunicationVolume result = CalculateRingVolume(per_step_data, replica_group_size, "AllReduce", formula, 2.0);
+        CommunicationVolume result = CalculateRingVolume(per_step_data, replica_group_size, "AllReduce", formula, 2.0, operand_size, result_size);
         CHECK_GT(result.per_device_volume, 0.0) << "per_device_comm_volume must be greater than 0.0, got: " << result.per_device_volume;
         return result;
     }
@@ -820,7 +874,7 @@ CommunicationVolume CalculateCommunicationVolume(const xla::HloInstruction* inst
             << " for instruction: " << instr->ToString();
 
         std::string formula = "operand_size * (" + std::to_string(replica_group_size) + "-1)";
-        CommunicationVolume result = CalculateRingVolume(operand_size, replica_group_size, "AllGather", formula);
+        CommunicationVolume result = CalculateRingVolume(operand_size, replica_group_size, "AllGather", formula, 1.0, operand_size, result_size);
         CHECK_GT(result.per_device_volume, 0.0) << "per_device_comm_volume must be greater than 0.0, got: " << result.per_device_volume;
         return result;
     }
@@ -835,7 +889,7 @@ CommunicationVolume CalculateCommunicationVolume(const xla::HloInstruction* inst
         }
 
         std::string formula = "result_size * (" + std::to_string(replica_group_size) + "-1)";
-        CommunicationVolume result = CalculateRingVolume(result_size, replica_group_size, "ReduceScatter", formula);
+        CommunicationVolume result = CalculateRingVolume(result_size, replica_group_size, "ReduceScatter", formula, 1.0, operand_size, result_size);
         if (result.per_device_volume == 0.0) {
             llvm::outs() << "WARN. Local reduce-scatter operation detected. "
                          << "Instruction: " << instr->ToString() << ", "
@@ -855,6 +909,8 @@ CommunicationVolume CalculateCommunicationVolume(const xla::HloInstruction* inst
       CommunicationVolume result = {
         operand_size,
         operand_size * 2,
+        operand_size,
+        result_size,
         "Point-to-point permutation",
         "operand_size * 2"
       };
@@ -862,7 +918,7 @@ CommunicationVolume CalculateCommunicationVolume(const xla::HloInstruction* inst
       return result;
     }
     default:
-      return {0.0, 0.0, "Unknown", "Unknown"};
+      return {0.0, 0.0, 0.0, 0.0, "Unknown", "Unknown"};
   }
 }
 
@@ -988,7 +1044,7 @@ int main(int argc, char* argv[]) {
       "comp_id",   "instruction_name", "opcode", "device_name", "comm_type",
       "comm_cost_us", "replica_group_size", "num_replica_groups",
       "intranode_comm_vol_gb", "internode_comm_vol_gb", "intranode_comm_bw_gbps", "internode_comm_bw_gbps",
-      "total_comm_vol_gb", "datatype"};
+      "total_comm_vol_gb", "operand_size_bytes", "result_size_bytes", "datatype", "num_hops", "per_link_cost_us"};
   device_stats_data.push_back(device_stats_header);
   comp_stats_data.push_back(comp_stats_header);
   comm_stats_data.push_back(comm_stats_header);
@@ -1032,6 +1088,7 @@ int main(int argc, char* argv[]) {
     }
 
     stream_executor::DeviceDescription gpu_device_info = gpu_device_info_result.value();
+    gpu_device_info.set_name(device_name);
     // uint64_t memory_limit = xla::gpu::GetSchedulerMemoryLimit(
     //     *hlo_module, gpu_device_info, pointer_size);
     // std::cout << "Mem validation passed. Memory limit(in GB):"
@@ -1121,12 +1178,10 @@ int main(int argc, char* argv[]) {
             } else {
               CHECK(1 == 0);
             }
-
             // Track compute time for entry computation
             if (is_entry_comp) {
               entry_compute_time += cost;
             }
-
             // FIXME: Runtime_data will be outdated
             runtime_data =
                 gpu_performance_model_.Get().EstimateRunTimeForInstruction(
@@ -1195,7 +1250,11 @@ int main(int argc, char* argv[]) {
                 std::to_string(comm_stats.intranode_comm_bw_gbps),
                 std::to_string(comm_stats.internode_comm_bw_gbps),
                 std::to_string(comm_stats.total_comm_vol_gb),
-                GetDataTypeFromInstruction(instr)
+                std::to_string(comm_volume.operand_size),
+                std::to_string(comm_volume.result_size),
+                GetDataTypeFromInstruction(instr),
+                std::to_string(comm_stats.num_hops),
+                std::to_string(comm_stats.per_link_cost_us)
             };
             comm_stats_data.push_back(comm_row);
 
@@ -1217,17 +1276,12 @@ int main(int argc, char* argv[]) {
             if (is_entry_comp) {
               entry_compute_time += cost;
             }
-
-
-
-
             // Add computation statistics to CSV data for all computations
             if (cost > 0) {
               inst_count += 1;
               AddCompStatsToCSV(comp_stats_data, comp_count, inst_count, std::string(deduplicated_name),
                                cost, runtime_data, device_name, instr);
             }
-
             // cost = ale_latency_estimator->NodeCost(instr);
             break;
           }

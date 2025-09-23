@@ -346,11 +346,13 @@ int64_t GpuPerformanceModelBase::CalculateEffectiveFlopsPerNs(
     // FIXME: Always use max number of cores
   int64_t n_active_fpus_per_core = gpu_device_info.fpus_per_core();
   int64_t n_active_core = gpu_device_info.core_count();
-
   int64_t fpu_count = n_active_core * n_active_fpus_per_core;
-
   double flop_per_ns_per_fpu = gpu_device_info.clock_rate_ghz() * /*fma:*/ 2;
   auto flop_per_ns = flop_per_ns_per_fpu * fpu_count;
+  // std::cout << "active_fpus_per_core:" << n_active_fpus_per_core << "\n";
+  // std::cout << "active_core:" << n_active_core << "\n";
+  // std::cout << "fpu_count:" << fpu_count << "\n";
+  // std::cout << "flop_per_ns" << flop_per_ns << "\n";
   return flop_per_ns;
 }
 

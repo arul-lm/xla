@@ -179,8 +179,7 @@ CommCostStats CalculateCommCost(double per_device_comm_volume,
                                const xla::HloInstruction* instr, uint64_t replica_group_size,
                                uint64_t num_replica_groups,
                                const std::string& hardware_architecture,
-                               const std::string& fallback_device_type = "",
-                               double non_overlap_factor = 1.0) {
+                               const std::string& fallback_device_type = "") {
   // Get device-specific configuration (already validated in GetIntraNodeConfigFromDeviceInfo)
   IntraNodeConfig intranode_config = GetIntraNodeConfigFromDeviceInfo(gpu_device_info, hardware_architecture, fallback_device_type);
 
@@ -248,9 +247,6 @@ CommCostStats CalculateCommCost(double per_device_comm_volume,
     per_link_cost_us = comm_cost_us / num_hops;
   }
 
-  // Apply non_overlap factor to communication cost
-  comm_cost_us *= non_overlap_factor;
-  per_link_cost_us *= non_overlap_factor;
 
   // Debug logging to catch any remaining NaN values
   if (std::isnan(comm_cost_us) || std::isnan(intranode_comm_vol_gb) || std::isnan(internode_comm_vol_gb) ||
@@ -268,7 +264,6 @@ CommCostStats CalculateCommCost(double per_device_comm_volume,
     llvm::outs() << "  internode_comm_vol_gb: " << internode_comm_vol_gb << "\n";
     llvm::outs() << "  intranode_comm_bw_gbps: " << intranode_comm_bw_gbps << "\n";
     llvm::outs() << "  internode_comm_bw_gbps: " << internode_comm_bw_gbps << "\n";
-    llvm::outs() << "  non_overlap_factor: " << non_overlap_factor << "\n";
     llvm::outs().flush();
   }
 
@@ -329,8 +324,7 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
                                    const std::vector<int64_t>& device_ids,
                                    const std::vector<int>& mesh_shape,
                                    const std::string& hardware_architecture,
-                                   const std::string& fallback_device_type = "",
-                                   double non_overlap_factor = 1.0) {
+                                   const std::string& fallback_device_type = "") {
   // Validate inputs
   CHECK_GE(per_device_comm_volume, 0.0) << "per_device_comm_volume must be greater than 0.0, got: " << per_device_comm_volume;
   CHECK_GE(replica_group_size, 1) << "replica_group_size must be at least 1, got: " << replica_group_size;
@@ -367,9 +361,6 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
   double per_link_cost_us = (per_device_comm_vol_gb / ici_bandwidth_per_link_gbps) * 1e6;
   double comm_cost_us = per_link_cost_us * number_of_hops;
 
-  // Apply non_overlap factor
-  comm_cost_us *= non_overlap_factor;
-  per_link_cost_us *= non_overlap_factor;
 
   // For TPU, all communication is intra-pod (within the 3D torus)
   double intranode_comm_vol_gb = per_device_comm_vol_gb;
@@ -404,12 +395,140 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
   };
 }
 
+struct InstructionTimelineEntry {
+  const xla::HloInstruction* instruction;
+  double start_time_us;
+  double end_time_us;
+  double duration_us;
+  bool is_compute_instruction;
+  bool is_comm_instruction;
+  std::string instruction_name;
+};
+
+struct OverlapStats {
+  double original_total_time_us;
+  double overlapped_total_time_us;
+  double overlap_savings_us;
+  double overlap_percentage;
+  double total_compute_time_us;
+  double total_comm_time_us;
+  double overlap_factor;
+  std::vector<InstructionTimelineEntry> timeline;
+};
+
+OverlapStats CalculateInstructionLevelOverlap(const std::vector<InstructionTimelineEntry>& timeline, double overlap_factor) {
+  CHECK_GE(overlap_factor, 0.0) << "overlap_factor must be non-negative, got: " << overlap_factor;
+  CHECK_LE(overlap_factor, 1.0) << "overlap_factor must be <= 1.0, got: " << overlap_factor;
+
+  if (timeline.empty()) {
+    return {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, overlap_factor, {}};
+  }
+
+  double original_total_time_us = 0.0;
+  double total_compute_time_us = 0.0;
+  double total_comm_time_us = 0.0;
+
+  for (const auto& entry : timeline) {
+    original_total_time_us += entry.duration_us;
+    if (entry.is_compute_instruction) {
+      total_compute_time_us += entry.duration_us;
+    }
+    if (entry.is_comm_instruction) {
+      total_comm_time_us += entry.duration_us;
+    }
+  }
+
+  if (overlap_factor == 0.0) {
+    return {
+      original_total_time_us,
+      original_total_time_us,
+      0.0,
+      0.0,
+      total_compute_time_us,
+      total_comm_time_us,
+      overlap_factor,
+      timeline
+    };
+  }
+
+  std::vector<InstructionTimelineEntry> overlapped_timeline = timeline;
+  double current_time_us = 0.0;
+  double last_compute_time_us = 0.0;
+  double last_comm_time_us = 0.0;
+  for (size_t i = 0; i < overlapped_timeline.size(); ++i) {
+    auto& current_instruction = overlapped_timeline[i];
+
+    if (current_instruction.start_time_us == 0.0){
+      // unscheduled instruction
+      current_instruction.start_time_us = current_time_us;
+      current_instruction.end_time_us = current_time_us + current_instruction.duration_us;
+    } else {
+      // current instruction is already scheduled.
+      current_time_us = current_instruction.start_time_us;
+    }
+    // Try to overlap with next instruction
+    if (overlap_factor > 0.0) {
+      size_t j = i + 1;
+      if (j < overlapped_timeline.size()) {
+        auto& next_instruction = overlapped_timeline[j];
+        bool can_overlap = (current_instruction.is_compute_instruction && next_instruction.is_comm_instruction) ||
+                          (current_instruction.is_comm_instruction && next_instruction.is_compute_instruction);
+        CHECK_EQ(next_instruction.start_time_us, 0.0) << "Next instruction start time is not 0.0";
+        if (can_overlap) {
+          double overlap_duration = current_instruction.duration_us * overlap_factor;
+          double next_start_time = current_instruction.start_time_us + (current_instruction.duration_us - overlap_duration);
+          if (next_instruction.is_compute_instruction) {
+            next_start_time = std::max(next_start_time, last_compute_time_us);
+          }
+          else if (next_instruction.is_comm_instruction) {
+            next_start_time = std::max(next_start_time, last_comm_time_us);
+          }
+          next_instruction.start_time_us = next_start_time;
+          next_instruction.end_time_us = next_start_time + next_instruction.duration_us;
+          current_time_us = next_start_time;
+        } else {
+          current_time_us = current_instruction.end_time_us;
+        }
+      } else {
+        llvm::outs() << "Nothing to overlap with\n";
+        current_time_us = current_instruction.end_time_us;
+      }
+    }
+    if (current_instruction.is_compute_instruction) {
+      last_compute_time_us = current_instruction.start_time_us + current_instruction.duration_us;
+    }
+    else if (current_instruction.is_comm_instruction) {
+      last_comm_time_us = current_instruction.start_time_us + current_instruction.duration_us;
+    }
+  }
+
+  double overlapped_total_time_us = 0.0;
+  for (const auto& entry : overlapped_timeline) {
+    overlapped_total_time_us = std::max(overlapped_total_time_us, entry.end_time_us);
+  }
+
+  double overlap_savings_us = original_total_time_us - overlapped_total_time_us;
+  double overlap_percentage = original_total_time_us > 0.0 ? (overlap_savings_us / original_total_time_us) * 100.0 : 0.0;
+
+  return {
+    original_total_time_us,
+    overlapped_total_time_us,
+    overlap_savings_us,
+    overlap_percentage,
+    total_compute_time_us,
+    total_comm_time_us,
+    overlap_factor,
+    overlapped_timeline
+  };
+}
+
 struct CliOpts {
   std::string hlo_module_file;
-  std::string comm_non_overlap = "1.0";
   std::vector<std::string> hardware_architectures;
   std::string output_dir = "stats";
   std::string mesh_shape = "4,4,4";
+  std::string overlap_factor_str = "0.0";
+  double overlap_factor = 0.0;
 };
 
 void writeCsv(std::ofstream& outputFile,
@@ -928,10 +1047,10 @@ int main(int argc, char* argv[]) {
   std::string hardware_architectures_str;
   std::vector<tsl::Flag> flag_list = {
       tsl::Flag("hlo-module-file", &opts.hlo_module_file, "Filename of HloModule"),
-      tsl::Flag("comm-non-overlap", &opts.comm_non_overlap, "Communication non-overlap factor (0.0 to 1.0)"),
       tsl::Flag("hardware-architectures", &hardware_architectures_str, "Comma-separated list of hardware architectures (e.g., h100_pcie,tpuv5p,tpuv6e)"),
       tsl::Flag("output-dir", &opts.output_dir, "Output directory for CSV files (default: stats)"),
-      tsl::Flag("mesh-shape", &opts.mesh_shape, "3D mesh shape for TPU communication (e.g., 4,4,4)")};
+      tsl::Flag("mesh-shape", &opts.mesh_shape, "3D mesh shape for TPU communication (e.g., 4,4,4)"),
+      tsl::Flag("overlap-factor", &opts.overlap_factor_str, "Compute-communication overlap factor (0.0-1.0, default: 0.0)")};
   xla::AppendDebugOptionsFlags(&flag_list);
   std::string usage_string = tsl::Flags::Usage(argv[0], flag_list);
   if (!tsl::Flags::Parse(&argc, argv, flag_list)) {
@@ -947,6 +1066,16 @@ int main(int argc, char* argv[]) {
       if (!arch.empty()) {
         opts.hardware_architectures.push_back(arch);
       }
+    }
+  }
+
+  // Parse overlap_factor from string
+  if (!opts.overlap_factor_str.empty()) {
+    char* end_ptr;
+    opts.overlap_factor = std::strtod(opts.overlap_factor_str.c_str(), &end_ptr);
+    if (*end_ptr != '\0' || opts.overlap_factor < 0.0 || opts.overlap_factor > 1.0) {
+      llvm::outs() << "Error: Overlap factor must be a valid number between 0.0 and 1.0, got: " << opts.overlap_factor_str << "\n";
+      return 1;
     }
   }
 
@@ -996,10 +1125,6 @@ int main(int argc, char* argv[]) {
   CHECK(opts.hlo_module_file.empty() == false)
       << "Path to HLO module file required";
 
-  // Validate comm_non_overlap factor
-  double comm_non_overlap_value = std::stod(opts.comm_non_overlap);
-  CHECK_GE(comm_non_overlap_value, 0.0) << "comm_non_overlap must be at least 0.0, got: " << comm_non_overlap_value;
-  CHECK_LE(comm_non_overlap_value, 1.0) << "comm_non_overlap must be at most 1.0, got: " << comm_non_overlap_value;
 
   // Validate hardware architectures
   absl::Status validation_status = ValidateHardwareArchitectures(opts.hardware_architectures);
@@ -1009,7 +1134,6 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  llvm::outs() << "Using comm_non_overlap factor: " << comm_non_overlap_value << "\n";
   llvm::outs() << "Using hardware architectures: ";
   for (size_t i = 0; i < opts.hardware_architectures.size(); ++i) {
     if (i > 0) llvm::outs() << ", ";
@@ -1030,12 +1154,17 @@ int main(int argc, char* argv[]) {
       createCsv(tsl::io::JoinPath(output_path, "device_stats.csv"));
   auto comp_stats_csv = createCsv(tsl::io::JoinPath(output_path, "comp_stats.csv"));
   auto comm_stats_csv = createCsv(tsl::io::JoinPath(output_path, "comm_stats.csv"));
-  if (!device_stats_csv.is_open() || !comp_stats_csv.is_open() || !comm_stats_csv.is_open()) {
+  auto overlap_stats_csv = createCsv(tsl::io::JoinPath(output_path, "overlap_stats.csv"));
+  auto instruction_timeline_csv = createCsv(tsl::io::JoinPath(output_path, "instruction_timeline.csv"));
+  if (!device_stats_csv.is_open() || !comp_stats_csv.is_open() || !comm_stats_csv.is_open() ||
+      !overlap_stats_csv.is_open() || !instruction_timeline_csv.is_open()) {
     return -1;
   }
 
-  std::vector<std::vector<std::string>> device_stats_data, comp_stats_data, comm_stats_data;
-  std::vector<std::string> device_stats_header = {"device_name", "latency", "compute_time", "comm_time"};
+  std::vector<std::vector<std::string>> device_stats_data, comp_stats_data, comm_stats_data, overlap_stats_data, instruction_timeline_data;
+  std::vector<std::string> device_stats_header = {
+      "device_name", "overlapped_latency_secs", "original_latency_secs", "compute_time_secs",
+      "comm_time_secs", "overlap_factor", "overlap_savings_secs", "overlap_percentage", "total_instructions"};
   std::vector<std::string> comp_stats_header = {
       "comp_id",   "idx",       "inst",       "group",         "latency(µs)",
       "tflops",    "bytes_read_gb", "bytes_written_gb", "compute_time",
@@ -1045,9 +1174,18 @@ int main(int argc, char* argv[]) {
       "comm_cost_us", "replica_group_size", "num_replica_groups",
       "intranode_comm_vol_gb", "internode_comm_vol_gb", "intranode_comm_bw_gbps", "internode_comm_bw_gbps",
       "total_comm_vol_gb", "operand_size_bytes", "result_size_bytes", "datatype", "num_hops", "per_link_cost_us"};
+  std::vector<std::string> overlap_stats_header = {
+      "device_name", "overlap_factor", "original_total_time_secs", "overlapped_total_time_secs",
+      "total_compute_time_secs", "total_comm_time_secs", "overlap_savings_secs", "overlap_percentage", "total_instructions"};
+  std::vector<std::string> instruction_timeline_header = {
+      "device_name", "instruction_name", "instruction_type", "original_duration_us",
+      "overlapped_start_time_us", "overlapped_end_time_us", "overlapped_duration_us", "is_compute", "is_comm"};
+
   device_stats_data.push_back(device_stats_header);
   comp_stats_data.push_back(comp_stats_header);
   comm_stats_data.push_back(comm_stats_header);
+  overlap_stats_data.push_back(overlap_stats_header);
+  instruction_timeline_data.push_back(instruction_timeline_header);
   std::string format = "hlo";
   std::unique_ptr<xla::HloModule> hlo_module =
       *xla::LoadModuleFromFile(opts.hlo_module_file, format, {});
@@ -1140,6 +1278,7 @@ int main(int argc, char* argv[]) {
     auto entry_comm_time = 0.0;  // Track communication time for entry computation
     absl::flat_hash_map<const xla::HloComputation*, double> computation_map;
     absl::flat_hash_map<const xla::HloComputation*, int> computation_idx;
+    std::vector<InstructionTimelineEntry> instruction_timeline;
     for (xla::HloComputation* computation : hlo_module->computations()) {
       comp_cost = 0;
       auto is_entry_comp = computation->IsEntryComputation();
@@ -1221,9 +1360,9 @@ int main(int argc, char* argv[]) {
               // Get device IDs and mesh shape for TPU communication cost calculation
               auto device_ids = GetDeviceIdsFromOneReplicaGroup(instr);
               // Use mesh shape from command line argument
-              comm_stats = CalculateTpuCommCost(comm_volume.per_device_volume, gpu_device_info, instr, replica_group_size, num_replica_groups, device_ids, mesh_shape, spec_file_name, "", comm_non_overlap_value);
+              comm_stats = CalculateTpuCommCost(comm_volume.per_device_volume, gpu_device_info, instr, replica_group_size, num_replica_groups, device_ids, mesh_shape, spec_file_name, "");
             } else {
-              comm_stats = CalculateCommCost(comm_volume.per_device_volume, gpu_device_info, instr, replica_group_size, num_replica_groups, spec_file_name, "", comm_non_overlap_value);
+              comm_stats = CalculateCommCost(comm_volume.per_device_volume, gpu_device_info, instr, replica_group_size, num_replica_groups, spec_file_name, "");
             }
             cost = comm_stats.comm_cost_us;
 
@@ -1300,6 +1439,41 @@ int main(int argc, char* argv[]) {
             break;
           }
         };                      // Switch ends here
+
+        // Add to instruction timeline if cost > 0
+        if (cost > 0.0) {
+          InstructionTimelineEntry timeline_entry;
+          timeline_entry.instruction = instr;
+          timeline_entry.duration_us = cost;
+          timeline_entry.start_time_us = 0.0;
+          timeline_entry.end_time_us = 0.0;
+          timeline_entry.instruction_name = std::string(deduplicated_name);
+
+          switch (opcode) {
+            case xla::HloOpcode::kReduceScatter:
+            case xla::HloOpcode::kCollectivePermute:
+            case xla::HloOpcode::kAllGather:
+            case xla::HloOpcode::kAllReduce: {
+              timeline_entry.is_compute_instruction = false;
+              timeline_entry.is_comm_instruction = true;
+              break;
+            }
+            case xla::HloOpcode::kDot:
+            case xla::HloOpcode::kWhile: {
+              timeline_entry.is_compute_instruction = true;
+              timeline_entry.is_comm_instruction = false;
+              break;
+            }
+            default: {
+              timeline_entry.is_compute_instruction = false;
+              timeline_entry.is_comm_instruction = false;
+              break;
+            }
+          }
+
+          instruction_timeline.push_back(timeline_entry);
+        }
+
         comp_cost += cost;
       } // Inst for loop ends
 
@@ -1313,33 +1487,93 @@ int main(int argc, char* argv[]) {
       comp_count += 1;
     }  // Comp for loop ends
 
+    // Calculate instruction-level overlapped latency
+    OverlapStats overlap_stats = CalculateInstructionLevelOverlap(instruction_timeline, opts.overlap_factor);
+
     // Print entry computation timing breakdown
     llvm::outs() << "=== Entry Computation Timing Breakdown ===\n";
     llvm::outs() << "Device: " << device_name << "\n";
-    llvm::outs() << "Total Compute Time: " << entry_compute_time / 1e6 << " seconds\n";
-    llvm::outs() << "Total Communication Time: " << entry_comm_time / 1e6 << " seconds\n";
-    llvm::outs() << "Total Time: " << entry_comp_cost / 1e6 << " seconds\n";
+    llvm::outs() << "Total Instructions Processed: " << instruction_timeline.size() << "\n";
+    if (opts.overlap_factor > 0.0) {
+      llvm::outs() << "Overlap Factor: " << opts.overlap_factor << "\n";
+      llvm::outs() << "Original Total Time: " << overlap_stats.original_total_time_us / 1e6 << " seconds\n";
+      llvm::outs() << "Overlapped Total Time: " << overlap_stats.overlapped_total_time_us / 1e6 << " seconds\n";
+      llvm::outs() << "Overlap Savings: " << overlap_stats.overlap_savings_us / 1e6 << " seconds ("
+                   << overlap_stats.overlap_percentage << "%)\n";
+    } else {
+      llvm::outs() << "Total Compute Time: " << overlap_stats.total_compute_time_us / 1e6 << " seconds\n";
+      llvm::outs() << "Total Communication Time: " << overlap_stats.total_comm_time_us / 1e6 << " seconds\n";
+      llvm::outs() << "Total Time: " << overlap_stats.original_total_time_us / 1e6 << " seconds\n";
+    }
     llvm::outs() << "==========================================\n";
     llvm::outs().flush();
 
-    // Use entry computation cost for device_stats
-    auto entry_comp_cost_in_secs = entry_comp_cost / 1e6;
-    auto entry_compute_time_in_secs = entry_compute_time / 1e6;
-    auto entry_comm_time_in_secs = entry_comm_time / 1e6;
+    // Use overlapped time for device_stats
+    auto overlapped_comp_cost_in_secs = overlap_stats.overlapped_total_time_us / 1e6;
+    auto original_comp_cost_in_secs = overlap_stats.original_total_time_us / 1e6;
+    auto total_compute_time_in_secs = overlap_stats.total_compute_time_us / 1e6;
+    auto total_comm_time_in_secs = overlap_stats.total_comm_time_us / 1e6;
     device_stats_data.push_back(
-        {device_name, std::to_string(entry_comp_cost_in_secs),
-         std::to_string(entry_compute_time_in_secs), std::to_string(entry_comm_time_in_secs)});
+        {device_name, std::to_string(overlapped_comp_cost_in_secs),
+         std::to_string(original_comp_cost_in_secs),
+         std::to_string(total_compute_time_in_secs),
+         std::to_string(total_comm_time_in_secs),
+         std::to_string(opts.overlap_factor),
+         std::to_string(overlap_stats.overlap_savings_us / 1e6),
+         std::to_string(overlap_stats.overlap_percentage),
+         std::to_string(instruction_timeline.size())});
+
+    // Add overlap statistics to CSV data
+    std::vector<std::string> overlap_row = {
+        device_name,
+        std::to_string(opts.overlap_factor),
+        std::to_string(overlap_stats.original_total_time_us / 1e6),
+        std::to_string(overlap_stats.overlapped_total_time_us / 1e6),
+        std::to_string(overlap_stats.total_compute_time_us / 1e6),
+        std::to_string(overlap_stats.total_comm_time_us / 1e6),
+        std::to_string(overlap_stats.overlap_savings_us / 1e6),
+        std::to_string(overlap_stats.overlap_percentage),
+        std::to_string(instruction_timeline.size())
+    };
+    overlap_stats_data.push_back(overlap_row);
+
+    // Add instruction timeline to CSV data
+    for (const auto& entry : overlap_stats.timeline) {
+      std::string instruction_type = "other";
+      if (entry.is_compute_instruction) instruction_type = "compute";
+      if (entry.is_comm_instruction) instruction_type = "comm";
+
+      std::vector<std::string> timeline_row = {
+          device_name,
+          entry.instruction_name,
+          instruction_type,
+          std::to_string(entry.duration_us),
+          std::to_string(entry.start_time_us),
+          std::to_string(entry.end_time_us),
+          std::to_string(entry.end_time_us - entry.start_time_us),
+          entry.is_compute_instruction ? "true" : "false",
+          entry.is_comm_instruction ? "true" : "false"
+      };
+      instruction_timeline_data.push_back(timeline_row);
+    }
+
     llvm::outs().flush();
   }
   writeCsv(device_stats_csv, device_stats_data);
   writeCsv(comp_stats_csv, comp_stats_data);
   writeCsv(comm_stats_csv, comm_stats_data);
+  writeCsv(overlap_stats_csv, overlap_stats_data);
+  writeCsv(instruction_timeline_csv, instruction_timeline_data);
   device_stats_csv.close();
   comp_stats_csv.close();
   comm_stats_csv.close();
+  overlap_stats_csv.close();
+  instruction_timeline_csv.close();
   llvm::outs() << "CSV files saved to: " << tsl::io::JoinPath(output_path, "device_stats.csv")
                << ", " << tsl::io::JoinPath(output_path, "comp_stats.csv")
-               << ", " << tsl::io::JoinPath(output_path, "comm_stats.csv") << "\n";
+               << ", " << tsl::io::JoinPath(output_path, "comm_stats.csv")
+               << ", " << tsl::io::JoinPath(output_path, "overlap_stats.csv")
+               << ", " << tsl::io::JoinPath(output_path, "instruction_timeline.csv") << "\n";
   llvm::outs() << "Done\n";
   return 0;
 }

@@ -77,31 +77,33 @@ struct IntraNodeConfig {
 // Device configuration structure
 struct DeviceConfig {
   std::string name_pattern;
-  int size;
-  double bandwidth_gbps;
-  double efficiency_factor;
+  double intranode_bandwidth_gbps;  // Intra-node unidirectional bandwidth in GB/s
+  double internode_bandwidth_gbps;  // Inter-node unidirectional bandwidth in GB/s
+  double intranode_efficiency_factor;  // Efficiency factor for intra-node communication
+  double internode_efficiency_factor;  // Efficiency factor for inter-node communication
   bool reassign_bandwidth;
   int links_per_chip;  // Number of ICI links per chip
+  std::vector<int> intranode_mesh_shape;  // Physical mesh shape for intra-node (pod slice) torus topology
+  std::vector<int> internode_mesh_shape;  // Physical mesh shape for inter-node (pod arrangement) torus topology
 };
 
 // Global device configuration lookup table
 static const std::vector<DeviceConfig> device_configs = {
-    {"h100", 8, 900.0, 0.92, false, 0},
-    {"h100_pcie", 8, 900.0, 0.92, false, 0},
-    {"a100", 8, 600.0, 0.92, false, 0},
-    {"v100", 8, 300.0, 0.88, false, 0},
-    {"p100", 8, 160.0, 0.80, false, 0},
-    {"a6000", 8, 64.0, 0.70, false, 0},
-    {"mi200", 8, 800.0, 0.90, false, 0},
-    {"mi300", 8, 1000.0, 0.93, false, 0},
-    {"psg100", 512, 8000.0, 0.92, true, 0},
-    {"tpuv4", 64, 90.0 * 6 / 2 * 64, 0.95, false, 6},
-    {"tpuv5e", 64, 90.0 * 4 / 2 * 64, 0.95, false, 4},
-    {"tpuv5p", 64, 180.0 * 6 / 2 * 64, 0.95, false, 6},
-    {"tpuv6e", 64, 180.0 * 4 / 2 * 64, 0.95, false, 4},
-    {"tpuv7e", 64, 200.0 * 4 / 2 * 64, 0.95, false, 4},
-    {"tpuv7el200", 64, 2000.0 * 4 / 2 * 64, 0.95, false, 4},
-    // {"tpuv7p", 64, 200.0 * 6 / 2 * 64, 0.95, false, 6}
+    {"h100", 900.0, 10.0, 0.92, 0.85, false, 0, {}, {}},
+    {"h100_pcie", 900.0, 10.0, 0.92, 0.85, false, 0, {}, {}},
+    {"a100", 600.0, 10.0, 0.92, 0.85, false, 0, {}, {}},
+    {"v100", 300.0, 10.0, 0.88, 0.80, false, 0, {}, {}},
+    {"p100", 160.0, 10.0, 0.80, 0.75, false, 0, {}, {}},
+    {"a6000", 64.0, 10.0, 0.70, 0.65, false, 0, {}, {}},
+    {"mi200", 800.0, 10.0, 0.90, 0.85, false, 0, {}, {}},
+    {"mi300", 1000.0, 10.0, 0.93, 0.88, false, 0, {}, {}},
+    {"psg100", 8000.0, 10.0, 0.92, 0.85, true, 0, {}, {}},
+    {"tpuv4", 90.0 / 2, 90.0 / 2, 0.95, 0.85, false, 6, {4, 4, 4}, {4, 4, 4}},
+    {"tpuv5e", 90.0 / 2, 90.0 / 2, 0.95, 0.85, false, 4, {4, 4, 4}, {4, 4, 4}},
+    {"tpuv5p", 180.0 / 2, 180.0 / 2, 0.95, 0.85, false, 6, {4, 4, 4}, {4, 4, 4}},
+    {"tpuv6e", 180.0 / 2, 180.0 / 2, 0.95, 0.85, false, 4, {4, 4, 4}, {4, 4, 4}},
+    {"tpuv7e", 200.0 / 2, 200.0 / 2, 0.95, 0.85, false, 4, {2, 2, 2}, {4, 4, 4}},
+    {"tpuv7el200", 2000.0 / 2, 2000.0 / 2, 0.95, 0.85, false, 4, {8, 8, 8}, {4, 4, 4}},
 };
 
 // Structure to hold communication cost statistics
@@ -126,6 +128,18 @@ std::string GetDataTypeFromInstruction(const xla::HloInstruction* instr);
 bool IsTpuDevice(const std::string& hardware_arch);
 
 
+
+// Helper function to calculate total size from mesh shape
+int CalculateMeshSize(const std::vector<int>& mesh_shape) {
+  if (mesh_shape.empty()) {
+    return 1;  // Default size for non-torus devices
+  }
+  int size = 1;
+  for (int dim : mesh_shape) {
+    size *= dim;
+  }
+  return size;
+}
 
 // Helper function to validate IntraNodeConfig values
 void ValidateIntraNodeConfig(const IntraNodeConfig& config) {
@@ -154,7 +168,9 @@ IntraNodeConfig GetIntraNodeConfigFromDeviceInfo(const stream_executor::DeviceDe
   // Search for exact device configuration match (case-insensitive)
   for (const auto& config : device_configs) {
     if (absl::AsciiStrToLower(device_name) == absl::AsciiStrToLower(config.name_pattern)) {
-      IntraNodeConfig result = {config.size, config.bandwidth_gbps, config.efficiency_factor, config.reassign_bandwidth};
+      // Calculate intranode_size from intranode_mesh_shape
+      int intranode_size = CalculateMeshSize(config.intranode_mesh_shape);
+      IntraNodeConfig result = {intranode_size, config.intranode_bandwidth_gbps, config.intranode_efficiency_factor, config.reassign_bandwidth};
       ValidateIntraNodeConfig(result);
       return result;
     }
@@ -298,22 +314,59 @@ int CalculateAverageHops(const std::vector<int>& mesh_shape) {
     return static_cast<int>(std::ceil(avg_hops));
 }
 
-int CalculateHopsFromDeviceIds(const std::vector<int64_t>& device_ids, const std::vector<int>& mesh_shape) {
-  // Assume every device communicates to the right.
-  // Find the distance between the first and second device.
-  // if second device does not exist, then hop_distance = 1
-  // if second device exists, then hop_distance = distance between the first and second device
-  // convert first device id to 3D coordinates
-  int x = device_ids[0] / (mesh_shape[0] * mesh_shape[1]);
-  int y = (device_ids[0] % (mesh_shape[0] * mesh_shape[1])) / mesh_shape[1];
-  int z = device_ids[0] % mesh_shape[1];
-  // convert second device id to 3D coordinates
-  int x2 = device_ids[1] / (mesh_shape[0] * mesh_shape[1]);
-  int y2 = (device_ids[1] % (mesh_shape[0] * mesh_shape[1])) / mesh_shape[1];
-  int z2 = device_ids[1] % mesh_shape[1];
-  // calculate the distance between the first and second device
-  int hop_distance = std::abs(x - x2) + std::abs(y - y2) + std::abs(z - z2);
-  return hop_distance;
+// Structure to hold torus hop results
+struct TorusHops {
+  int copper_hops;  // Number of hops over copper links (within pod slice)
+  int ici_hops;     // Number of hops over ICI links (between pod slices)
+};
+
+// Helper function to convert node ID to 3D coordinates
+std::tuple<int, int, int> IdToCoord(int64_t node_id, const std::vector<int>& dims) {
+  int x = node_id % dims[0];
+  int y = (node_id / dims[0]) % dims[1];
+  int z = (node_id / (dims[0] * dims[1])) % dims[2];
+  return std::make_tuple(x, y, z);
+}
+
+// Helper function to compute torus distance in 3D
+int TorusDistance3D(const std::tuple<int, int, int>& p1, const std::tuple<int, int, int>& p2, const std::vector<int>& dims) {
+  int dist = 0;
+  int delta_x = std::abs(std::get<0>(p1) - std::get<0>(p2));
+  int delta_y = std::abs(std::get<1>(p1) - std::get<1>(p2));
+  int delta_z = std::abs(std::get<2>(p1) - std::get<2>(p2));
+
+  dist += std::min(delta_x, dims[0] - delta_x);
+  dist += std::min(delta_y, dims[1] - delta_y);
+  dist += std::min(delta_z, dims[2] - delta_z);
+
+  return dist;
+}
+
+// Calculate hops over copper and ICI links in a 3D torus topology from integer node IDs
+TorusHops TorusHopsInt(int64_t src_id, int64_t dst_id, const std::vector<int>& pod_dims, const std::vector<int>& slice_dims) {
+  // Total nodes in pod slice and slicing arrangement
+  int64_t pod_size = pod_dims[0] * pod_dims[1] * pod_dims[2];
+
+  // Extract pod slice IDs from node IDs
+  int64_t src_pod_id = src_id / pod_size;
+  int64_t dst_pod_id = dst_id / pod_size;
+
+  // Extract slice node IDs within pod
+  int64_t src_slice_id = src_id % pod_size;
+  int64_t dst_slice_id = dst_id % pod_size;
+
+  // Convert IDs to coordinates
+  auto src_pod_coord = IdToCoord(src_pod_id, slice_dims);
+  auto dst_pod_coord = IdToCoord(dst_pod_id, slice_dims);
+
+  auto src_slice_coord = IdToCoord(src_slice_id, pod_dims);
+  auto dst_slice_coord = IdToCoord(dst_slice_id, pod_dims);
+
+  // Calculate hops
+  int copper_hops = TorusDistance3D(src_slice_coord, dst_slice_coord, pod_dims);
+  int ici_hops = TorusDistance3D(src_pod_coord, dst_pod_coord, slice_dims);
+
+  return {copper_hops, ici_hops};
 }
 
 // Function to calculate TPU communication cost based on 3D torus topology
@@ -335,40 +388,76 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
   // Get device-specific ICI bandwidth from device configuration
   IntraNodeConfig intranode_config = GetIntraNodeConfigFromDeviceInfo(tpu_device_info, hardware_architecture, fallback_device_type);
 
-  // Get the device configuration to access links_per_chip using hardware architecture
+  // Get the device configuration to access links_per_chip, mesh shapes, bandwidths, and efficiency factors using hardware architecture
   int links_per_chip = 6;  // Default for TPU v4
+  std::vector<int> intranode_mesh_shape = {4, 4, 4};  // Default intra-node mesh shape
+  std::vector<int> internode_mesh_shape = {4, 4, 4};  // Default inter-node mesh shape
+  double intranode_bandwidth_gbps = intranode_config.bandwidth_gbps;  // Default to intranode config
+  double internode_bandwidth_gbps = 10.0;  // Default inter-node bandwidth
+  double intranode_efficiency_factor = intranode_config.efficiency_factor;  // Default to intranode config
+  double internode_efficiency_factor = 0.85;  // Default inter-node efficiency
 
-  // Find the device configuration to get links_per_chip using hardware architecture
+  // Find the device configuration to get all parameters using hardware architecture
   for (const auto& config : device_configs) {
     if (absl::StrContains(absl::AsciiStrToLower(hardware_architecture), absl::AsciiStrToLower(config.name_pattern))) {
       links_per_chip = config.links_per_chip;
+      intranode_bandwidth_gbps = config.intranode_bandwidth_gbps;
+      internode_bandwidth_gbps = config.internode_bandwidth_gbps;
+      intranode_efficiency_factor = config.intranode_efficiency_factor;
+      internode_efficiency_factor = config.internode_efficiency_factor;
+      if (!config.intranode_mesh_shape.empty()) {
+        intranode_mesh_shape = config.intranode_mesh_shape;
+      }
+      if (!config.internode_mesh_shape.empty()) {
+        internode_mesh_shape = config.internode_mesh_shape;
+      }
       break;
     }
   }
 
-  // Calculate ICI bandwidth per hop (per link)
-  // per-link bandwidth = total_bandwidth / (links_per_chip * num_chips)
-  double ici_bandwidth_per_link_gbps = (intranode_config.bandwidth_gbps * intranode_config.efficiency_factor) / (links_per_chip * intranode_config.size);
+  // Calculate sizes from mesh shapes
+  int intranode_size = CalculateMeshSize(intranode_mesh_shape);
+  int internode_size = CalculateMeshSize(internode_mesh_shape);
 
+  // Calculate bandwidth per link for both intra-node and inter-node (already per-link unidirectional)
+  double intranode_bandwidth_per_link_gbps = intranode_bandwidth_gbps * intranode_efficiency_factor;
+  double internode_bandwidth_per_link_gbps = internode_bandwidth_gbps * internode_efficiency_factor;
 
-  // Calculate maximum distance between two neighbors in the replica group
-  // int number_of_hops = CalculateMaxHop(device_ids, mesh_shape);
-  int number_of_hops = CalculateHopsFromDeviceIds(device_ids, mesh_shape);
+  TorusHops torus_hops = TorusHopsInt(device_ids[0], device_ids[1], intranode_mesh_shape, internode_mesh_shape);
+  int number_of_hops = torus_hops.copper_hops + torus_hops.ici_hops;
   // Calculate communication volume per device in GB
   double per_device_comm_vol_gb = per_device_comm_volume / (1024.0 * 1024.0 * 1024.0);
 
-  // Calculate communication cost using the formula:
-  double per_link_cost_us = (per_device_comm_vol_gb / ici_bandwidth_per_link_gbps) * 1e6;
-  double comm_cost_us = per_link_cost_us * number_of_hops;
-
+  // Calculate communication cost using weighted bandwidth based on hop types
+  double copper_cost_us = (per_device_comm_vol_gb / intranode_bandwidth_per_link_gbps) * 1e6 * torus_hops.copper_hops;
+  // Add one hop to account for the transfer to OCS
+  // ici_hops is the number of OCSs traversed.
+  // number_of_hops within OCSs = OCS_count - 1
+  // 1 hop to send to OCS and 1 hop to receive from OCS
+  int ici_hops = 0;
+  if (torus_hops.ici_hops > 0) {
+      ici_hops = (torus_hops.ici_hops - 1) + 2;
+  }
+  double ici_cost_us = (per_device_comm_vol_gb / internode_bandwidth_per_link_gbps) * 1e6 * (ici_hops);
+  double comm_cost_us = copper_cost_us + ici_cost_us;
 
   // For TPU, all communication is intra-pod (within the 3D torus)
-  double intranode_comm_vol_gb = per_device_comm_vol_gb;
+  double intranode_comm_vol_gb = 0.0;
   double internode_comm_vol_gb = 0.0;
-  double total_comm_vol_gb = intranode_comm_vol_gb;
+  if (torus_hops.copper_hops > 0){
+      intranode_comm_vol_gb = per_device_comm_vol_gb;
+  }
+  if (torus_hops.ici_hops) {
+      internode_comm_vol_gb = per_device_comm_vol_gb;
+  }
+  double total_comm_vol_gb = per_device_comm_vol_gb * torus_hops.copper_hops + per_device_comm_vol_gb * torus_hops.ici_hops;
 
-  // Determine communication type (all TPU communication is intra-pod for now)
-  CommType comm_type = CommType::IntraNode;
+  CommType comm_type;
+  if (torus_hops.ici_hops == 0){
+      comm_type = CommType::IntraNode;
+  } else {
+      comm_type = CommType::InterNode;
+  }
 
   // Debug logging
   if (std::isnan(comm_cost_us) || std::isnan(intranode_comm_vol_gb) || std::isnan(total_comm_vol_gb)) {
@@ -376,8 +465,10 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
     llvm::outs() << "  per_device_comm_volume: " << per_device_comm_volume << "\n";
     llvm::outs() << "  replica_group_size: " << replica_group_size << "\n";
     llvm::outs() << "  links_per_chip: " << links_per_chip << "\n";
-    llvm::outs() << "  number_of_hops: " << number_of_hops << "\n";
-    llvm::outs() << "  ici_bandwidth_per_link_gbps: " << ici_bandwidth_per_link_gbps << "\n";
+    llvm::outs() << "  copper_hops: " << torus_hops.copper_hops << "\n";
+    llvm::outs() << "  ici_hops: " << torus_hops.ici_hops << "\n";
+    llvm::outs() << "  intranode_bandwidth_per_link_gbps: " << intranode_bandwidth_per_link_gbps << "\n";
+    llvm::outs() << "  internode_bandwidth_per_link_gbps: " << internode_bandwidth_per_link_gbps << "\n";
     llvm::outs() << "  comm_cost_us: " << comm_cost_us << "\n";
     llvm::outs().flush();
   }
@@ -387,11 +478,11 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
     comm_cost_us,
     intranode_comm_vol_gb,
     internode_comm_vol_gb,
-    ici_bandwidth_per_link_gbps,  // intranode_comm_bw_gbps
-    0.0,                          // internode_comm_bw_gbps (not used for TPU)
+    intranode_bandwidth_per_link_gbps,  // intranode_comm_bw_gbps
+    internode_bandwidth_per_link_gbps,  // internode_comm_bw_gbps
     total_comm_vol_gb,
     number_of_hops,
-    per_link_cost_us
+    comm_cost_us / number_of_hops  // per_link_cost_us
   };
 }
 
@@ -931,12 +1022,6 @@ void AddCompStatsToCSV(std::vector<std::vector<std::string>>& comp_stats_data,
     std::to_string(throughput), device_name, GetDataTypeFromInstruction(instr)
   });
 }
-
-
-
-
-
-
 
 // Communication volume calculation with topology support
 struct CommunicationVolume {

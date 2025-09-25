@@ -28,3 +28,4 @@ tools/python_bin_path.sh
 *.mlir
 raw_torch_trace/*
 raw_trace/*
+overlap_*/

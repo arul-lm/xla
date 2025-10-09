@@ -366,8 +366,7 @@ TorusHops TorusHopsInt(int64_t src_id, int64_t dst_id, const std::vector<int>& p
   int copper_hops = TorusDistance3D(src_slice_coord, dst_slice_coord, pod_dims);
   int ici_hops = TorusDistance3D(src_pod_coord, dst_pod_coord, slice_dims);
 
-  // return {copper_hops, ici_hops};
-  return {1, 0};
+  return {copper_hops, ici_hops};
 }
 
 // Function to calculate TPU communication cost based on 3D torus topology

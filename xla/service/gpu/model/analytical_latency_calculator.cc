@@ -436,9 +436,9 @@ CommCostStats CalculateTpuCommCost(double per_device_comm_volume,
     int number_of_hops = torus_hops.copper_hops + torus_hops.ici_hops;
     double copper_cost_us = (per_device_comm_vol_gb / intranode_bandwidth_per_link_gbps) * 1e6 * torus_hops.copper_hops;
     int ici_hops = 0;
-    // if (torus_hops.ici_hops > 0) {
-    //     ici_hops = (torus_hops.ici_hops - 1) + 2;
-    // }
+    if (torus_hops.ici_hops > 0) {
+        ici_hops = torus_hops.ici_hops;
+    }
     double ici_cost_us = (per_device_comm_vol_gb / internode_bandwidth_per_link_gbps) * 1e6 * (ici_hops);
     double comm_cost_us = copper_cost_us + ici_cost_us;
     if (comm_cost_us > max_comm_cost_us) {

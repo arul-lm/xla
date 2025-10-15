@@ -74,6 +74,7 @@ absl::StatusOr<int64_t> NumRanks(const T& instr) {
   // Get number of ranks for this instruction based on replica groups and mode.
   int64_t num_devices = config.num_partitions();
   int64_t num_replicas = config.replica_count();
+
   TF_ASSIGN_OR_RETURN(
       std::vector<int64_t> participant_counts,
       GetPariticipantCountsForReplicaGroups(
@@ -384,6 +385,9 @@ absl::Status GpuHloCostAnalysis::HandleAllReduce(
   TF_ASSIGN_OR_RETURN(int64_t num_ranks,
                       NumRanks(*Cast<HloAllReduceInstruction>(allreduce)));
 
+  const HloModuleConfig& config = allreduce->GetModule()->config();
+  // const auto num_replica_groups = allreduce->replica_groups();
+  const auto num_devices = config.num_partitions();
   VLOG(5) << "Computing cost for " << num_ranks << " ranks in "
           << allreduce->ToString();
 
@@ -402,9 +406,12 @@ absl::Status GpuHloCostAnalysis::HandleAllReduce(
     bytes_accessed += GetShapeSize(operand->shape());
   }
   current_properties_.set_output_bytes_accessed(output_bytes_accessed);
-  current_properties_[kCollBytesTransferred] = output_bytes_accessed;
+  current_properties_[kCollBytesTransferred] = output_bytes_accessed * 2;
+  // std::cout << "All Reduce:" << output_bytes_accessed << "\n";
+  // std::cout << std::flush;
   current_properties_[kBytesAccessedKey] = bytes_accessed;
-  current_properties_[kCollNumDevicesKey] = num_ranks;
+  // current_properties_[kCollNumDevicesKey] = num_ranks;
+  current_properties_[kCollNumDevicesKey] = num_devices;
   // Since allreduce has compute, we need to get flops for the compute
   // part which is an elementwise op.
   current_properties_[kFlopsKey] = GetFlopsForElementwiseOp(
@@ -513,9 +520,35 @@ absl::Status GpuHloCostAnalysis::HandleAllGather(const HloInstruction* hlo) {
   int64_t read_bytes = rank_size_bytes * num_ranks;
 
   current_properties_[kBytesAccessedKey] = write_bytes + read_bytes;
-  current_properties_[kCollBytesTransferred] = bytes_transferred;
 
+
+  current_properties_[kCollBytesTransferred] = bytes_transferred;
+  int num_intra_steps = 2 * (num_ranks - 1);
+  float scaling_ratio = (1.0 * num_ranks) / num_intra_steps;
+  current_properties_[kCollAlgoScaleRatioKey] = scaling_ratio;
+  const HloModuleConfig& config = hlo->GetModule()->config();
+  const auto num_devices = config.num_partitions();
+  current_properties_[kCollNumDevicesKey] = num_devices;
   return absl::OkStatus();
+}
+
+absl::Status GpuHloCostAnalysis::HandleCollectivePermute(const HloInstruction* hlo) {
+    const auto* coll_perm_inst = Cast<HloCollectivePermuteInstruction>(hlo);
+    auto st_pairs = coll_perm_inst->source_target_pairs();
+    auto num_ranks = st_pairs.size();
+    int64_t bytes_transferred = ShapeSize(hlo->shape(), options_.shape_size);
+    int64_t rank_size_bytes = bytes_transferred / num_ranks;
+    int64_t write_bytes = rank_size_bytes * (2 * num_ranks - 1);
+    int64_t read_bytes = rank_size_bytes * num_ranks;
+
+    current_properties_[kBytesAccessedKey] = write_bytes + read_bytes;
+    current_properties_[kCollBytesTransferred] = bytes_transferred;
+
+    int num_intra_steps = 2 * (num_ranks - 1);
+    float scaling_ratio = (1.0 * num_ranks) / num_intra_steps;
+    current_properties_[kCollAlgoScaleRatioKey] = scaling_ratio;
+    current_properties_[kCollNumDevicesKey] = num_ranks;
+    return absl::OkStatus();
 }
 
 absl::Status GpuHloCostAnalysis::HandleAllGatherStart(
@@ -564,7 +597,9 @@ absl::Status GpuHloCostAnalysis::HandleReduceScatter(
   current_properties_[kCollBytesTransferred] = bytes_transferred;
   current_properties_[kFlopsKey] = GetFlopsForElementwiseOp(
       hlo->to_apply()->root_instruction()->opcode(), hlo->shape());
-
+  const HloModuleConfig& config = hlo->GetModule()->config();
+  const auto num_devices = config.num_partitions();
+  current_properties_[kCollNumDevicesKey] = num_devices;
   return absl::OkStatus();
 }
 

@@ -45,6 +45,7 @@ limitations under the License.
 #include "xla/service/spmd/shardy/stablehlo_round_trip/shard_map_import.h"
 #include "xla/service/spmd/shardy/stablehlo_round_trip/stablehlo_export.h"
 #include "xla/service/spmd/shardy/stablehlo_round_trip/stablehlo_import.h"
+#include "stablehlo/dialect/ChloOps.h"
 
 int main(int argc, char** argv) {
   mlir::registerAllPasses();

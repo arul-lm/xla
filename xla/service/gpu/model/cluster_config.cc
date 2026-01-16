@@ -191,6 +191,9 @@ void GpuClusterConfig::BuildDomains() {
   double per_xpu_bw_gbytes =
       scaleup_fabric_link_bw_gbytes_ * scaleup_fabric_port_count_;
   if (scaleup_fabric_topology_ == "all2all") {
+    // Scaleup domain size = number of GPUs per scaleup domain
+    // Each scalable unit has compute_units_per_tray GPUs
+    // Scaleup domain spans across all scalable units in the same domain
     scaleup_domain_.scaleup_device_count =
         scaleup_switch_port_count_; // 1 link per device
     scaleup_domain_.scaleup_switch_count =

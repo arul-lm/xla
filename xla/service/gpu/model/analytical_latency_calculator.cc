@@ -36,6 +36,7 @@
 #include "xla/tsl/platform/env.h"
 #include "xla/util.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/MLIRContext.h"
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -331,7 +332,7 @@ absl::Status ValidateHardwareArchitectures(
 
     // Construct the expected config file path
     auto config_path =
-        tsl::io::JoinPath("/xla", "xla", "tools", "hlo_opt", "gpu_specs",
+        tsl::io::JoinPath("/xla", "xla", "backends", "gpu", "target_config", "specs",
                           absl::StrCat(arch, ".txtpb"));
 
     // Check if the config file exists
@@ -347,13 +348,13 @@ absl::Status ValidateHardwareArchitectures(
         "Invalid hardware architectures - config files not found:\n";
     for (const std::string &invalid_arch : invalid_architectures) {
       auto expected_path =
-          tsl::io::JoinPath("/xla", "xla", "tools", "hlo_opt", "gpu_specs",
+          tsl::io::JoinPath("/xla", "xla", "backends", "gpu", "target_config", "specs",
                             absl::StrCat(invalid_arch, ".txtpb"));
       error_msg += absl::StrCat("  - ", invalid_arch,
                                 " (expected: ", expected_path, ")\n");
     }
     error_msg += "\nAvailable hardware architectures can be found in "
-                 "/xla/xla/tools/hlo_opt/gpu_specs/";
+                 "/xla/xla/backends/gpu/target_config/specs/";
     return absl::InvalidArgumentError(error_msg);
   }
 
@@ -912,7 +913,7 @@ int main(int argc, char *argv[]) {
     stream_executor::GpuTargetConfigProto proto;
     std::string spec_string;
     auto path =
-        tsl::io::JoinPath("/xla", "xla", "tools", "hlo_opt", "gpu_specs",
+        tsl::io::JoinPath("/xla", "xla", "backends", "gpu", "target_config", "specs",
                           absl::StrCat(file_name, ".txtpb"));
     absl::Status is_file_read =
         tsl::ReadFileToString(tsl::Env::Default(), path, &spec_string);
@@ -958,7 +959,8 @@ int main(int argc, char *argv[]) {
 
     auto gle_latency_estimator =
         std::make_unique<xla::gpu::GpuLatencyEstimator>(pointer_size);
-    xla::gpu::GpuPerformanceModelOwning gpu_performance_model_(gpu_device_info);
+    mlir::MLIRContext mlir_context;
+    xla::gpu::GpuPerformanceModelOwning gpu_performance_model_(gpu_device_info, &mlir_context);
 
     if (opts.fix_ragged_dot_flops) {
       for (xla::HloComputation* computation : hlo_module->computations()) {

@@ -617,12 +617,12 @@ absl::Status GpuHloCostAnalysis::HandleAllToAll(const HloInstruction* hlo) {
   return absl::OkStatus();
 }
 
-absl::Status GpuHloCostAnalysis::HandleCollectivePermute(
-    const HloInstruction* hlo) {
-  current_properties_[kCollBytesTransferred] +=
-      ShapeUtil::ByteSizeOf(hlo->operand(0)->shape());
-  return absl::OkStatus();
-}
+// absl::Status GpuHloCostAnalysis::HandleCollectivePermute(
+//     const HloInstruction* hlo) {
+//   current_properties_[kCollBytesTransferred] +=
+//       ShapeUtil::ByteSizeOf(hlo->operand(0)->shape());
+//   return absl::OkStatus();
+// }
 
 absl::Status GpuHloCostAnalysis::HandleCollectivePermuteStart(
     const HloInstruction* hlo) {

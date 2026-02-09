@@ -333,8 +333,9 @@ GpuClusterConfig::PathBetweenDevices(int src_device_id,
 
   int scaleup_domain_size = scaleup_domain_.scaleup_device_count;
 
-  // Check if this is a B200 configuration (based on name pattern)
-  if (name_pattern_.find("b200") != std::string::npos) {
+  // Check if this is a B200 or R200 configuration (based on name pattern)
+  if (name_pattern_.find("b200") != std::string::npos ||
+      name_pattern_.find("r200") != std::string::npos) {
     if (scaleup_src_coord.first == scaleup_dest_coord.first) {
       // Same scaleup domain - direct NvSwitch connection
       return {PathComponent::GPU, PathComponent::NvSwitch, PathComponent::GPU};
@@ -655,7 +656,8 @@ std::unique_ptr<ClusterConfig>
 CreateClusterConfig(const std::string &device_type) {
   if (device_type.find("tpu") != std::string::npos) {
     return std::make_unique<TpuClusterConfig>();
-  } else if (device_type.find("b200") != std::string::npos) {
+  } else if (device_type.find("b200") != std::string::npos ||
+             device_type.find("r200") != std::string::npos) {
     return std::make_unique<GpuClusterConfig>();
   } else {
     std::cerr << "ERROR: CreateClusterConfig - Unknown device type: "

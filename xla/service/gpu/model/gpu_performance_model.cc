@@ -18,7 +18,9 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
+#include <string>
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -128,6 +130,12 @@ bool IsBlackwell(const stream_executor::DeviceDescription& device_info) {
     return absl::StrContains(lower_name, "b200");
 }
 
+bool IsRubin(const stream_executor::DeviceDescription& device_info) {
+  auto name = device_info.name();
+  std::string lower_name = absl::AsciiStrToLower(name);
+  return absl::StrContains(lower_name, "r200");
+}
+
 // Helper function to get Blackwell tensor core multiplier based on data type
 // Returns a multiplier relative to bf16 performance (1.0 = bf16 baseline)
 double GetBlackwellDataTypeMultiplier(const xla::HloInstruction* instr) {
@@ -160,6 +168,38 @@ double GetBlackwellDataTypeMultiplier(const xla::HloInstruction* instr) {
   }
 }
 
+// Helper function to get Rubin tensor core multiplier based on data type
+// Returns a multiplier relative to bf16 performance (1.0 = bf16 baseline)
+double GetRubinDataTypeMultiplier(const xla::HloInstruction* instr) {
+  if (!instr) return 1.0;
+
+  auto prim_type = instr->shape().element_type();
+  switch (prim_type) {
+    case xla::PrimitiveType::F16:
+    case xla::PrimitiveType::BF16:
+      return 1.0;  // Base case (bf16)
+    case xla::PrimitiveType::F32:
+      return 0.5;  // F32 is 2x slower than bf16 on tensor cores
+    case xla::PrimitiveType::S8:
+    case xla::PrimitiveType::U8:
+      return 2.0;  // INT8 is 2x faster than bf16
+    case xla::PrimitiveType::S16:
+    case xla::PrimitiveType::U16:
+      return 1.0;  // INT16 same as bf16
+    case xla::PrimitiveType::S32:
+    case xla::PrimitiveType::U32:
+      return 0.5;  // INT32 is 2x slower than bf16
+    case xla::PrimitiveType::F8E5M2:
+    case xla::PrimitiveType::F8E4M3FN:
+    case xla::PrimitiveType::F8E4M3B11FNUZ:
+    case xla::PrimitiveType::F8E5M2FNUZ:
+    case xla::PrimitiveType::F8E4M3FNUZ:
+      return 4.0;  // FP8 is 4x faster than bf16 on Rubin
+    default:
+      return 1.0;  // Default to bf16 performance
+  }
+}
+
 absl::Duration ComputeBlackwellTime(
     const stream_executor::DeviceDescription& gpu_device_info,
     int64_t flops,
@@ -174,7 +214,6 @@ absl::Duration ComputeBlackwellTime(
 
     // Get data type multiplier based on instruction's element type
     double data_type_multiplier = GetBlackwellDataTypeMultiplier(instr);
-
     auto max_ops_with_boost = max_bf16_ops * sparse_boost * data_type_multiplier;
     // Revert to linear: return absl::Nanoseconds(1.0f * flops / max_ops_with_boost);
 
@@ -190,10 +229,63 @@ absl::Duration ComputeBlackwellTime(
     // Effective FLOPS per nanosecond = max_ops_with_boost * utilization
     // Note: max_ops_with_boost is in units of ops per nanosecond
     double effective_flops_per_nanosecond = max_ops_with_boost * utilization;
-    //std::cout << "flops:" << flops << "\n";
-    //std::cout << "effective_flops_per_nanosecond:" << effective_flops_per_nanosecond << "\n";
     double compute_time_nanoseconds = static_cast<double>(flops) / effective_flops_per_nanosecond;
     return absl::Nanoseconds(compute_time_nanoseconds);
+}
+
+absl::Duration ComputeRubinTime(
+    const stream_executor::DeviceDescription& gpu_device_info,
+    int64_t flops,
+    int64_t num_blocks,
+    int64_t num_threads_per_block,
+    const xla::HloInstruction* instr) {
+  // Same WGMMA model as Blackwell but 2x base throughput and Rubin-specific
+  // data type multipliers.
+  double rubin_bf16_ops_per_ns =
+      2.0 * 256 * 256 * 16 * gpu_device_info.clock_rate_ghz();
+  constexpr double kSparseBoost = 2.0;
+  double data_type_multiplier = GetRubinDataTypeMultiplier(instr);
+  double max_ops_with_boost =
+      rubin_bf16_ops_per_ns * kSparseBoost * data_type_multiplier;
+
+  constexpr double kU_MAX = 0.80;
+  constexpr double kKAPPA = 0.04;
+  constexpr double kF_REF = 1e12;
+  constexpr double kU_MIN = 0.1;
+  double utilization = std::max(
+      kU_MIN,
+      kU_MAX * (1.0 - std::exp(-kKAPPA * static_cast<double>(flops) / kF_REF)));
+  double effective_flops_per_nanosecond = max_ops_with_boost * utilization;
+  double compute_time_nanoseconds =
+      static_cast<double>(flops) / effective_flops_per_nanosecond;
+  return absl::Nanoseconds(compute_time_nanoseconds);
+}
+
+absl::Duration ComputeTimeFromPeakMatrixOps(
+    const stream_executor::DeviceDescription& gpu_device_info, int64_t flops,
+    const xla::HloInstruction* instr) {
+  xla::PrimitiveType dtype = instr->shape().element_type();
+  int64_t peak_ops_per_ns =
+      GpuPerformanceModelBase::CalculatePeakMatrixOpsPerNs(gpu_device_info, dtype);
+
+  // LOG(INFO) << "PeakMatrixOpsPerNs: " << peak_ops_per_ns
+  //           << " (device=" << gpu_device_info.name()
+  //           << " dtype=" << xla::PrimitiveType_Name(dtype)
+  //           << " peak_TFLOPS=" << (peak_ops_per_ns / 1000.0) << ")";
+
+  // Apply same saturation model as WGMMA path for consistency.
+  constexpr double kU_MAX = 0.80;
+  constexpr double kKAPPA = 0.04;
+  constexpr double kF_REF = 1e12;
+  constexpr double kU_MIN = 0.1;
+  double utilization = std::max(
+      kU_MIN,
+      kU_MAX * (1.0 - std::exp(-kKAPPA * static_cast<double>(flops) / kF_REF)));
+  double effective_ops_per_ns = static_cast<double>(peak_ops_per_ns) * utilization;
+  double compute_time_nanoseconds =
+      (effective_ops_per_ns > 0) ? static_cast<double>(flops) / effective_ops_per_ns
+                                : 0.0;
+  return absl::Nanoseconds(compute_time_nanoseconds);
 }
 
 absl::Duration ComputeTpuTime(
@@ -239,10 +331,15 @@ EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(
   absl::Duration compute_time;
   if(IsTpuDevice(device_info_)){
       compute_time = ComputeTpuTime(device_info_, flops, num_blocks, launch_dimensions.num_threads_per_block());
-  } else if(IsBlackwell(device_info_)){
-      compute_time = ComputeBlackwellTime(device_info_, flops, num_blocks, launch_dimensions.num_threads_per_block(), instr);
-  }
-  else {
+  } else if (IsBlackwell(device_info_)) {
+    // Use peak matrix ops from .txtpb (matrix_unit_description) instead of
+    // hardcoded WGMMA. ComputeBlackwellTime() kept for reference/fallback.
+    compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr);
+  } else if (IsRubin(device_info_)) {
+    // Use peak matrix ops from .txtpb (R200/R200L200 have 2x ops_per_clock).
+    // ComputeRubinTime() kept for reference/fallback.
+    compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr);
+  } else {
       compute_time =
           ComputeTime(device_info_, flops, num_blocks,
                       launch_dimensions.num_threads_per_block());

@@ -375,7 +375,6 @@ int64_t GpuPerformanceModelBase::CalculatePeakMatrixOpsPerNs(
         gpu_device_info, /*num_blocks=*/gpu_device_info.core_count(),
         /*num_threads_per_block=*/gpu_device_info.fpus_per_core());
   }
-
   // FMA is counted as 2 ops.
   double flops_per_ns_per_unit =
       dtype_rates->clock_rate_ghz * dtype_rates->ops_per_clock * 2;

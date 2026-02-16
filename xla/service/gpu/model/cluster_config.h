@@ -248,7 +248,11 @@ public:
 // Factory function to create cluster config based on device type
 std::unique_ptr<ClusterConfig> CreateClusterConfig(const std::string& device_type);
 
-// Helper function to get cluster config by name pattern
-std::unique_ptr<ClusterConfig> GetClusterConfigByName(const std::string& device_name);
+// Helper function to get cluster config by name pattern.
+// configs_dir: when non-empty, look for device_name.config under this dir;
+// when empty, use default path xla/service/gpu/model/configs/.
+std::unique_ptr<ClusterConfig> GetClusterConfigByName(
+    const std::string& device_name,
+    const std::string& configs_dir = "");
 
 #endif // CLUSTER_CONFIG_H

@@ -2,6 +2,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "tsl/platform/logging.h"
+#include "tsl/platform/path.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/stream_executor/device_description.h"
 #include "llvm/Support/raw_ostream.h"
@@ -671,8 +672,8 @@ static std::unordered_map<std::string, std::unique_ptr<ClusterConfig>>
     config_cache;
 
 // Helper function to get device config by name pattern
-std::unique_ptr<ClusterConfig>
-GetClusterConfigByName(const std::string &device_name) {
+std::unique_ptr<ClusterConfig> GetClusterConfigByName(
+    const std::string &device_name, const std::string &configs_dir) {
   // Check cache first
   auto it = config_cache.find(device_name);
   if (it != config_cache.end()) {
@@ -686,9 +687,12 @@ GetClusterConfigByName(const std::string &device_name) {
     }
   }
 
-  // Use the working path that we know exists
-  std::string config_file =
-      "xla/service/gpu/model/configs/" + device_name + ".config";
+  std::string config_file;
+  if (!configs_dir.empty()) {
+    config_file = tsl::io::JoinPath(configs_dir, device_name + ".config");
+  } else {
+    config_file = "xla/service/gpu/model/configs/" + device_name + ".config";
+  }
 
   auto config = CreateClusterConfig(device_name);
   if (!config) {

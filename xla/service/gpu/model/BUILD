@@ -63,12 +63,10 @@ xla_cc_test(
 #     visibility = ["//visibility:public"],
 # )
 
-xla_cc_binary(
-    name = "analytical_latency_calculator",
-    srcs = ["analytical_latency_calculator.cc"],
-    data = [
-        "//xla/service/gpu/model/configs:all_configs",
-    ],
+cc_library(
+    name = "analytical_latency_calculator_core",
+    srcs = ["analytical_latency_calculator_core.cc"],
+    hdrs = ["analytical_latency_calculator_core.h"],
     deps = [
         ":cluster_config",
         ":analytical_latency_estimator",
@@ -87,9 +85,27 @@ xla_cc_binary(
         "//xla/service/gpu:gpu_hlo_schedule",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:device_description_proto_cc",
+        "//xla/tsl/platform:env",
         "//xla/tsl/platform:status",
+        "@tsl//tsl/platform:path",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/time",
+    ],
+)
+
+xla_cc_binary(
+    name = "analytical_latency_calculator",
+    srcs = ["analytical_latency_calculator.cc"],
+    data = [
+        "//xla/service/gpu/model/configs:all_configs",
+    ],
+    deps = [
+        ":analytical_latency_calculator_core",
+        "//xla:debug_options_flags",
+        "//xla/tsl/util:command_line_flags",
+        "@tsl//tsl/platform:platform_port",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
     ],
 )
 
@@ -420,6 +436,73 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@llvm-project//mlir:IR",
+    ],
+)
+
+# Shard library: accepts hw_arch txtpb string and datatype, computes
+# CalculatePeakMatrixOpsPerNs. Minimal surface for tools/tests that only need
+# peak matrix ops from a spec file.
+cc_library(
+    name = "peak_matrix_ops_shard",
+    srcs = ["peak_matrix_ops_shard.cc"],
+    hdrs = [
+        "peak_matrix_ops_shard.h",
+        "peak_matrix_ops_shard_c.h",
+    ],
+    alwayslink = True,
+    deps = [
+        ":gpu_performance_model_base",
+        "//xla:xla_data_proto_cc",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:device_description_proto_cc",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/status:statusor",
+        "@tsl//tsl/platform:protobuf",
+    ],
+)
+
+cc_binary(
+    name = "libpeak_ops_ffi.so",
+    linkshared = True,  # This tells Bazel to build a shared library, not an executable
+    deps = [
+        ":peak_matrix_ops_shard",
+    ],
+)
+
+cc_library(
+    name = "analytical_latency_calculator_ffi",
+    srcs = ["analytical_latency_calculator_ffi.cc"],
+    hdrs = ["analytical_latency_calculator_c.h"],
+    alwayslink = True,
+    deps = [
+        ":analytical_latency_calculator_core",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_binary(
+    name = "libanalytical_latency_ffi.so",
+    linkshared = True,
+    data = [
+        "//xla/service/gpu/model/configs:all_configs",
+    ],
+    deps = [
+        ":analytical_latency_calculator_ffi",
+    ],
+)
+
+cc_binary(
+    name = "libxla_bridge_all.so",
+    linkshared = True,
+    data = [
+        "//xla/service/gpu/model/configs:all_configs",
+    ],
+    deps = [
+        ":peak_matrix_ops_shard",
+        ":analytical_latency_calculator_ffi",
     ],
 )
 

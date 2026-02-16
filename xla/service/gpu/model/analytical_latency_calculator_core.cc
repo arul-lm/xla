@@ -308,23 +308,17 @@ const char kSpecsRelativePath[] = "xla/backends/gpu/target_config/specs";
 const char kConfigsRelativePath[] = "xla/service/gpu/model/configs";
 
 // Resolve the directory containing cluster *.config files.
+// Requires opts.gpu_model_data_root to be non-empty.
 std::string ResolveConfigsDir(
     const xla::gpu::AnalyticalLatencyCalculatorOpts& opts) {
-  if (!opts.gpu_model_data_root.empty()) {
-    return tsl::io::JoinPath(opts.gpu_model_data_root, kConfigsRelativePath);
-  }
-  return "";
+  return tsl::io::JoinPath(opts.gpu_model_data_root, kConfigsRelativePath);
 }
 
 // Resolve the directory containing GPU target config spec files (*.txtpb).
-// When opts.gpu_model_data_root is set, use it; otherwise use Docker path /xla.
+// Requires opts.gpu_model_data_root to be non-empty.
 std::string ResolveSpecsDir(
     const xla::gpu::AnalyticalLatencyCalculatorOpts& opts) {
-  if (!opts.gpu_model_data_root.empty()) {
-    return tsl::io::JoinPath(opts.gpu_model_data_root, kSpecsRelativePath);
-  }
-  return tsl::io::JoinPath("/xla", "xla", "backends", "gpu", "target_config",
-                           "specs");
+  return tsl::io::JoinPath(opts.gpu_model_data_root, kSpecsRelativePath);
 }
 
 // Helper function to validate hardware architectures and check if config files
@@ -717,6 +711,10 @@ absl::Status RunAnalyticalLatencyCalculation(
     const std::string& output_path_prefix) {
   CHECK(!opts.hlo_module_file.empty())
       << "Path to HLO module file required";
+  CHECK(!opts.gpu_model_data_root.empty())
+      << "gpu_model_data_root is required";
+  CHECK(!opts.output_dir.empty()) << "output_dir is required";
+  CHECK(!opts.mesh_shape.empty()) << "mesh_shape is required";
 
   const std::string specs_dir = ResolveSpecsDir(opts);
   const std::string configs_dir = ResolveConfigsDir(opts);
@@ -738,10 +736,14 @@ absl::Status RunAnalyticalLatencyCalculation(
                << "x" << mesh_shape[2] << "\n";
   llvm::outs().flush();
 
-  std::string output_path =
-      tsl::io::IsAbsolutePath(opts.output_dir)
-          ? opts.output_dir
-          : tsl::io::JoinPath(output_path_prefix, opts.output_dir);
+  std::string output_path;
+  if (tsl::io::IsAbsolutePath(opts.output_dir)) {
+    output_path = opts.output_dir;
+  } else if (!output_path_prefix.empty()) {
+    output_path = tsl::io::JoinPath(output_path_prefix, opts.output_dir);
+  } else {
+    output_path = opts.output_dir;  // relative to current directory
+  }
   if (!tsl::Env::Default()->FileExists(output_path).ok()) {
     absl::Status create_status =
         tsl::Env::Default()->RecursivelyCreateDir(output_path);

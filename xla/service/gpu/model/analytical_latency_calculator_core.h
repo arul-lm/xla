@@ -25,18 +25,18 @@ namespace xla {
 namespace gpu {
 
 // Options for running the analytical latency calculation. Can be populated
-// from CLI flags or from library (FFI) callers.
+// from CLI flags or from library (FFI) callers. No defaults: all fields must
+// be set by the caller.
 struct AnalyticalLatencyCalculatorOpts {
   std::string hlo_module_file;
   std::vector<std::string> hardware_architectures;
-  std::string output_dir = "stats";
-  std::string mesh_shape = "4,4,4";
-  std::string overlap_factor_str = "0.0";
-  double overlap_factor = 0.0;
-  bool fix_ragged_dot_flops = false;
-  bool dump_modified_module = false;
-  /** Optional root for model data (specs + cluster configs). When set, used for
-   * path resolution; empty = use default paths (e.g. /xla in Docker). */
+  std::string output_dir;
+  std::string mesh_shape;
+  std::string overlap_factor_str;
+  double overlap_factor;
+  bool fix_ragged_dot_flops;
+  bool dump_modified_module;
+  /** Root for model data (specs + cluster configs). Required. */
   std::string gpu_model_data_root;
 };
 

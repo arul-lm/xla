@@ -265,13 +265,12 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
     const stream_executor::DeviceDescription& gpu_device_info, int64_t flops,
     const xla::HloInstruction* instr) {
   xla::PrimitiveType dtype = instr->shape().element_type();
+
   int64_t peak_ops_per_ns =
       GpuPerformanceModelBase::CalculatePeakMatrixOpsPerNs(gpu_device_info, dtype);
 
-  // LOG(INFO) << "PeakMatrixOpsPerNs: " << peak_ops_per_ns
-  //           << " (device=" << gpu_device_info.name()
-  //           << " dtype=" << xla::PrimitiveType_Name(dtype)
-  //           << " peak_TFLOPS=" << (peak_ops_per_ns / 1000.0) << ")";
+  // Enable sparse boost.
+  peak_ops_per_ns = peak_ops_per_ns * 2;
 
   // Apply same saturation model as WGMMA path for consistency.
   constexpr double kU_MAX = 0.80;
@@ -282,6 +281,12 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
       kU_MIN,
       kU_MAX * (1.0 - std::exp(-kKAPPA * static_cast<double>(flops) / kF_REF)));
   double effective_ops_per_ns = static_cast<double>(peak_ops_per_ns) * utilization;
+
+  // LOG(INFO) << "PeakMatrixOpsPerNs: " << peak_ops_per_ns
+  //           << " (device=" << gpu_device_info.name()
+  //           << " dtype=" << xla::PrimitiveType_Name(dtype)
+  //           << " peak_TFLOPS=" << (peak_ops_per_ns / 1000.0) << ")"
+  //           << "EffectiveOpsPerNs: " << effective_ops_per_ns;
   double compute_time_nanoseconds =
       (effective_ops_per_ns > 0) ? static_cast<double>(flops) / effective_ops_per_ns
                                 : 0.0;

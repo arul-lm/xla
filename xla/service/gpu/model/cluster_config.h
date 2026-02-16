@@ -72,7 +72,7 @@ public:
         const std::vector<int64_t>& device_ids,
         const std::vector<int>& mesh_shape,
         const std::string& hardware_architecture,
-        const std::string& fallback_device_type = "")  = 0;
+        const std::string& fallback_device_type)  = 0;
 };
 
 // TPU Cluster Configuration
@@ -102,7 +102,7 @@ public:
         const std::vector<int64_t>& device_ids,
         const std::vector<int>& mesh_shape,
         const std::string& hardware_architecture,
-        const std::string& fallback_device_type = "")  override;
+        const std::string& fallback_device_type)  override;
     
     // TPU-specific methods
     void SetConfig(const std::string& name_pattern,
@@ -197,7 +197,7 @@ public:
         const std::vector<int64_t>& device_ids,
         const std::vector<int>& mesh_shape,
         const std::string& hardware_architecture,
-        const std::string& fallback_device_type = "")  override;
+        const std::string& fallback_device_type)  override;
     
     // GPU-specific methods
     void SetConfig(const std::string& name_pattern,
@@ -249,10 +249,10 @@ public:
 std::unique_ptr<ClusterConfig> CreateClusterConfig(const std::string& device_type);
 
 // Helper function to get cluster config by name pattern.
-// configs_dir: when non-empty, look for device_name.config under this dir;
-// when empty, use default path xla/service/gpu/model/configs/.
+// configs_dir: directory containing device_name.config; when empty, uses
+// path xla/service/gpu/model/configs/ (legacy, for callers that do not pass it).
 std::unique_ptr<ClusterConfig> GetClusterConfigByName(
     const std::string& device_name,
-    const std::string& configs_dir = "");
+    const std::string& configs_dir);
 
 #endif // CLUSTER_CONFIG_H

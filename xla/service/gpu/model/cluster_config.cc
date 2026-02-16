@@ -777,7 +777,7 @@ IntraNodeConfig GetIntraNodeConfigFromDeviceInfo(
   }
 
   // Get device configuration using the new system and cast to TpuClusterConfig
-  auto device_config = GetClusterConfigByName(device_name);
+  auto device_config = GetClusterConfigByName(device_name, "");
   auto tpu_config = dynamic_cast<TpuClusterConfig *>(device_config.get());
   if (tpu_config) {
     // Calculate intranode_size from intranode_mesh_shape

@@ -43,7 +43,6 @@ int analytical_latency_calculator_run(
     const char* hlo_module_file,
     const char* hardware_architectures,
     const char* output_dir,
-    const char* output_path_prefix,
     const char* gpu_model_data_root,
     const char* mesh_shape,
     double overlap_factor,
@@ -61,24 +60,27 @@ int analytical_latency_calculator_run(
                      error_buffer_size);
     return 1;
   }
+  if (output_dir == nullptr || std::strlen(output_dir) == 0) {
+    CopyErrorMessage("output_dir is required", error_buffer, error_buffer_size);
+    return 1;
+  }
+  if (gpu_model_data_root == nullptr ||
+      std::strlen(gpu_model_data_root) == 0) {
+    CopyErrorMessage("gpu_model_data_root is required", error_buffer,
+                     error_buffer_size);
+    return 1;
+  }
 
   xla::gpu::AnalyticalLatencyCalculatorOpts opts;
   opts.hlo_module_file = hlo_module_file;
+  opts.output_dir = output_dir;
+  opts.mesh_shape = mesh_shape;
+  opts.overlap_factor_str = std::to_string(overlap_factor);
   opts.overlap_factor = overlap_factor;
+  opts.gpu_model_data_root = gpu_model_data_root;
   opts.fix_ragged_dot_flops = (fix_ragged_dot_flops != 0);
   opts.dump_modified_module = (dump_modified_module != 0);
-
-  if (output_dir != nullptr && std::strlen(output_dir) > 0) {
-    opts.output_dir = output_dir;
-  }
-  std::string output_prefix_str =
-      (output_path_prefix != nullptr && std::strlen(output_path_prefix) > 0)
-          ? std::string(output_path_prefix)
-          : ".";
-  if (gpu_model_data_root != nullptr &&
-      std::strlen(gpu_model_data_root) > 0) {
-    opts.gpu_model_data_root = gpu_model_data_root;
-  }
+  std::string output_prefix_str;  // empty: output_dir is absolute or relative to cwd
 
   if (hardware_architectures != nullptr &&
       std::strlen(hardware_architectures) > 0) {

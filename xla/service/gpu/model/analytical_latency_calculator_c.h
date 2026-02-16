@@ -28,16 +28,15 @@ extern "C" {
 
 /* Runs the analytical latency calculation: loads the HLO module, runs
    cost/communication analysis for each hardware architecture, and writes
-   CSV outputs under (output_path_prefix)/(output_dir).
+   CSV outputs under output_dir (absolute path, or relative to current directory).
 
-   hlo_module_file: path to the HLO module file (required).
+   All string parameters are required and must be non-NULL and non-empty
+   unless noted.
+
+   hlo_module_file: path to the HLO module file.
    hardware_architectures: comma-separated list (e.g. "h100_pcie,b200l200").
-   output_dir: subdirectory for CSV files; NULL or empty = "stats".
-   output_path_prefix: base path for output; NULL or empty = "." (use "/xla"
-     only when running inside a Docker container).
-   gpu_model_data_root: optional root for model data (specs *.txtpb and
-     cluster *.config files). When set, both are looked up under this root.
-     NULL or empty = use default paths (/xla in Docker, etc.).
+   output_dir: directory for CSV files (absolute or relative to current directory).
+   gpu_model_data_root: root for model data (specs *.txtpb and cluster *.config).
    mesh_shape: exactly 3 positive integers, comma-separated (e.g. "4,4,4").
    overlap_factor: 0.0 to 1.0 (compute-communication overlap).
    fix_ragged_dot_flops: 0 = false, non-zero = true.
@@ -53,7 +52,6 @@ int analytical_latency_calculator_run(
     const char* hlo_module_file,
     const char* hardware_architectures,
     const char* output_dir,
-    const char* output_path_prefix,
     const char* gpu_model_data_root,
     const char* mesh_shape,
     double overlap_factor,

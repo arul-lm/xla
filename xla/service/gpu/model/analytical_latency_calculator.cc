@@ -14,30 +14,55 @@ int main(int argc, char *argv[]) {
   llvm::errs().tie(&llvm::outs());
   CliOpts opts;
   std::string hardware_architectures_str;
-  std::string output_path_prefix = ".";
+  std::string output_path_prefix;
   std::vector<tsl::Flag> flag_list = {
       tsl::Flag("hlo-module-file", &opts.hlo_module_file,
-                "Filename of HloModule"),
+                "Path to HLO module file (required)"),
       tsl::Flag("hardware-architectures", &hardware_architectures_str,
-                "Comma-separated list of hardware architectures (e.g., "
-                "h100_pcie,tpuv5p,tpuv6e)"),
+                "Comma-separated list of hardware architectures (required)"),
       tsl::Flag("output-dir", &opts.output_dir,
-                "Output directory for CSV files (default: stats)"),
+                "Output directory for CSV files (required)"),
       tsl::Flag("output-path-prefix", &output_path_prefix,
-                "Base path for output; use /xla when running inside Docker "
-                "(default: .)"),
+                "Base path for output when output-dir is relative (required)"),
+      tsl::Flag("gpu-model-data-root", &opts.gpu_model_data_root,
+                "Root for model data: specs and cluster configs (required)"),
       tsl::Flag("mesh-shape", &opts.mesh_shape,
-                "3D mesh shape for TPU communication (e.g., 4,4,4)"),
-      tsl::Flag(
-          "overlap-factor", &opts.overlap_factor_str,
-          "Compute-communication overlap factor (0.0-1.0, default: 0.0)"),
+                "3D mesh shape, e.g. 4,4,4 (required)"),
+      tsl::Flag("overlap-factor", &opts.overlap_factor_str,
+                "Compute-communication overlap factor 0.0-1.0 (required)"),
       tsl::Flag("fix-ragged-dot-flops", &opts.fix_ragged_dot_flops,
-                "Enable fix for ragged_dot FLOP calculation (default: false)"),
+                "Enable fix for ragged_dot FLOP calculation"),
       tsl::Flag("dump-modified-module", &opts.dump_modified_module,
-                "Dump modified HLO module to file (default: false)")};
+                "Dump modified HLO module to file")};
   xla::AppendDebugOptionsFlags(&flag_list);
   std::string usage_string = tsl::Flags::Usage(argv[0], flag_list);
   if (!tsl::Flags::Parse(&argc, argv, flag_list)) {
+    return 1;
+  }
+
+  // Require all mandatory flags
+  if (opts.hlo_module_file.empty()) {
+    llvm::outs() << "Error: --hlo-module-file is required\n";
+    return 1;
+  }
+  if (opts.output_dir.empty()) {
+    llvm::outs() << "Error: --output-dir is required\n";
+    return 1;
+  }
+  if (output_path_prefix.empty()) {
+    llvm::outs() << "Error: --output-path-prefix is required\n";
+    return 1;
+  }
+  if (opts.gpu_model_data_root.empty()) {
+    llvm::outs() << "Error: --gpu-model-data-root is required\n";
+    return 1;
+  }
+  if (opts.mesh_shape.empty()) {
+    llvm::outs() << "Error: --mesh-shape is required\n";
+    return 1;
+  }
+  if (opts.overlap_factor_str.empty()) {
+    llvm::outs() << "Error: --overlap-factor is required\n";
     return 1;
   }
 
@@ -99,6 +124,12 @@ int main(int argc, char *argv[]) {
         mesh_shape.push_back(value);
       }
     }
+  }
+
+  if (opts.hardware_architectures.empty()) {
+    llvm::outs() << "Error: At least one hardware architecture is required "
+                    "(--hardware-architectures)\n";
+    return 1;
   }
 
   if (mesh_shape.size() != 3) {

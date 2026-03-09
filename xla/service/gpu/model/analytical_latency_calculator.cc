@@ -15,6 +15,7 @@ int main(int argc, char *argv[]) {
   CliOpts opts;
   std::string hardware_architectures_str;
   std::string output_path_prefix;
+  std::string scale_memory_bandwidth_str = "1.0";
   std::vector<tsl::Flag> flag_list = {
       tsl::Flag("hlo-module-file", &opts.hlo_module_file,
                 "Path to HLO module file (required)"),
@@ -32,6 +33,10 @@ int main(int argc, char *argv[]) {
                 "Compute-communication overlap factor 0.0-1.0 (required)"),
       tsl::Flag("fix-ragged-dot-flops", &opts.fix_ragged_dot_flops,
                 "Enable fix for ragged_dot FLOP calculation"),
+      tsl::Flag("scale-memory-bandwidth", &scale_memory_bandwidth_str,
+                "Scale memory bandwidth by this factor (default 1.0). Use e.g. "
+                "10 to verify memory-bound: if total time drops a lot, workload "
+                "is memory-bound."),
       tsl::Flag("dump-modified-module", &opts.dump_modified_module,
                 "Dump modified HLO module to file")};
   xla::AppendDebugOptionsFlags(&flag_list);
@@ -88,6 +93,19 @@ int main(int argc, char *argv[]) {
       llvm::outs() << "Error: Overlap factor must be a valid number between "
                       "0.0 and 1.0, got: "
                    << opts.overlap_factor_str << "\n";
+      return 1;
+    }
+  }
+
+  // Parse scale_memory_bandwidth (optional, default 1.0)
+  if (!scale_memory_bandwidth_str.empty()) {
+    char *end_ptr;
+    opts.scale_memory_bandwidth =
+        std::strtod(scale_memory_bandwidth_str.c_str(), &end_ptr);
+    if (*end_ptr != '\0' || opts.scale_memory_bandwidth <= 0.0) {
+      llvm::outs() << "Error: scale-memory-bandwidth must be a positive number, "
+                      "got: "
+                   << scale_memory_bandwidth_str << "\n";
       return 1;
     }
   }

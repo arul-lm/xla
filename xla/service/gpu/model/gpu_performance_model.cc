@@ -127,13 +127,15 @@ bool IsTpuDevice(const stream_executor::DeviceDescription& device_info) {
 bool IsBlackwell(const stream_executor::DeviceDescription& device_info) {
     auto name = device_info.name();
     std::string lower_name = absl::AsciiStrToLower(name);
-    return absl::StrContains(lower_name, "b200");
+    return absl::StrContains(lower_name, "b200") ||
+           absl::StrContains(lower_name, "b300");
 }
 
 bool IsRubin(const stream_executor::DeviceDescription& device_info) {
   auto name = device_info.name();
   std::string lower_name = absl::AsciiStrToLower(name);
-  return absl::StrContains(lower_name, "r200");
+  return absl::StrContains(lower_name, "r200") ||
+         absl::StrContains(lower_name, "rcpx");
 }
 
 // Helper function to get Blackwell tensor core multiplier based on data type
@@ -263,8 +265,17 @@ absl::Duration ComputeRubinTime(
 
 absl::Duration ComputeTimeFromPeakMatrixOps(
     const stream_executor::DeviceDescription& gpu_device_info, int64_t flops,
-    const xla::HloInstruction* instr) {
+    const xla::HloInstruction* instr,
+    double* out_effective_ops_per_ns = nullptr) {
+  // Use compute precision (first operand) for dots so FP4 vs FP8 get different
+  // peak matrix ops; result type is often F32/BF16 accumulation and would
+  // otherwise make FP4 and FP8 variants look the same.
   xla::PrimitiveType dtype = instr->shape().element_type();
+  if ((instr->opcode() == xla::HloOpcode::kDot ||
+       instr->opcode() == xla::HloOpcode::kRaggedDot) &&
+      instr->operand_count() >= 1) {
+    dtype = instr->operand(0)->shape().element_type();
+  }
 
   int64_t peak_ops_per_ns =
       GpuPerformanceModelBase::CalculatePeakMatrixOpsPerNs(gpu_device_info, dtype);
@@ -290,6 +301,9 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
   double compute_time_nanoseconds =
       (effective_ops_per_ns > 0) ? static_cast<double>(flops) / effective_ops_per_ns
                                 : 0.0;
+  if (out_effective_ops_per_ns != nullptr) {
+    *out_effective_ops_per_ns = effective_ops_per_ns;
+  }
   return absl::Nanoseconds(compute_time_nanoseconds);
 }
 
@@ -334,16 +348,27 @@ EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(
   int64_t num_blocks = launch_dimensions.num_blocks();
 
   absl::Duration compute_time;
+  std::optional<double> effective_matrix_tflops;
   if(IsTpuDevice(device_info_)){
       compute_time = ComputeTpuTime(device_info_, flops, num_blocks, launch_dimensions.num_threads_per_block());
   } else if (IsBlackwell(device_info_)) {
     // Use peak matrix ops from .txtpb (matrix_unit_description) instead of
     // hardcoded WGMMA. ComputeBlackwellTime() kept for reference/fallback.
-    compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr);
+    double effective_ops_per_ns = 0.0;
+    compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr,
+                                                &effective_ops_per_ns);
+    if (effective_ops_per_ns > 0) {
+      effective_matrix_tflops = effective_ops_per_ns / 1000.0;  // ops/ns -> TFLOPS
+    }
   } else if (IsRubin(device_info_)) {
     // Use peak matrix ops from .txtpb (R200/R200L200 have 2x ops_per_clock).
     // ComputeRubinTime() kept for reference/fallback.
-    compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr);
+    double effective_ops_per_ns = 0.0;
+    compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr,
+                                                &effective_ops_per_ns);
+    if (effective_ops_per_ns > 0) {
+      effective_matrix_tflops = effective_ops_per_ns / 1000.0;  // ops/ns -> TFLOPS
+    }
   } else {
       compute_time =
           ComputeTime(device_info_, flops, num_blocks,
@@ -378,9 +403,9 @@ EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(
   absl::Duration exec_time =
       CombineComputeAndMemoryAccessTime(compute_time, read_time + write_time);
 
-  EstimateRunTimeData runtime_data = {flops,     bytes_read, bytes_written,
-                                      read_time, write_time, compute_time,
-                                      exec_time};
+  EstimateRunTimeData runtime_data = {
+      flops,     bytes_read, bytes_written, read_time, write_time,
+      compute_time, exec_time, effective_matrix_tflops};
   VLOG(3) << "Runtime data for HLO: " << instr->name() << "\n"
           << launch_dimensions.ToString() << "\n"
           << runtime_data.ToString();
@@ -480,7 +505,7 @@ absl::Duration GpuPerformanceModel::EstimateRunTimeForFusionImpl(
           << launch_dimensions.ToString() << "\n"
           << EstimateRunTimeData{flops,     bytes_read, bytes_written,
                                  read_time, write_time, compute_time,
-                                 exec_time}
+                                 exec_time, std::nullopt}
                  .ToString();
 
   return exec_time;

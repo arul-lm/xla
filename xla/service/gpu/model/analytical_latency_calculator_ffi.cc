@@ -48,6 +48,7 @@ int analytical_latency_calculator_run(
     double overlap_factor,
     int fix_ragged_dot_flops,
     int dump_modified_module,
+    double scale_memory_bandwidth,
     char* error_buffer,
     size_t error_buffer_size) {
   if (hlo_module_file == nullptr || std::strlen(hlo_module_file) == 0) {
@@ -70,6 +71,11 @@ int analytical_latency_calculator_run(
                      error_buffer_size);
     return 1;
   }
+  if (scale_memory_bandwidth <= 0.0) {
+    CopyErrorMessage("scale_memory_bandwidth must be a positive number",
+                     error_buffer, error_buffer_size);
+    return 1;
+  }
 
   xla::gpu::AnalyticalLatencyCalculatorOpts opts;
   opts.hlo_module_file = hlo_module_file;
@@ -80,6 +86,7 @@ int analytical_latency_calculator_run(
   opts.gpu_model_data_root = gpu_model_data_root;
   opts.fix_ragged_dot_flops = (fix_ragged_dot_flops != 0);
   opts.dump_modified_module = (dump_modified_module != 0);
+  opts.scale_memory_bandwidth = scale_memory_bandwidth;
   std::string output_prefix_str;  // empty: output_dir is absolute or relative to cwd
 
   if (hardware_architectures != nullptr &&

@@ -46,6 +46,9 @@ struct EstimateRunTimeData {
   absl::Duration compute_time;
   absl::Duration exec_time;
 
+  // Effective matrix ops (TFLOPS) actually used to compute compute_time for this op (i.e. flops/compute_time in TFLOPS). Set when on matrix-op path (e.g. Rubin/Blackwell dots); empty otherwise.
+  std::optional<double> effective_matrix_tflops;
+
   // Returns an estimate that is guaranteed to be zero.
   static EstimateRunTimeData Zero() {
     return EstimateRunTimeData{/*flops=*/0,
@@ -54,7 +57,8 @@ struct EstimateRunTimeData {
                                /*read_time=*/absl::ZeroDuration(),
                                /*write_time=*/absl::ZeroDuration(),
                                /*compute_time=*/absl::ZeroDuration(),
-                               /*exec_time=*/absl::ZeroDuration()};
+                               /*exec_time=*/absl::ZeroDuration(),
+                               /*effective_matrix_tflops=*/std::nullopt};
   }
 
   // Returns an estimate that is guaranteed to be larger than any real runtime.
@@ -66,7 +70,8 @@ struct EstimateRunTimeData {
         /*read_time=*/absl::InfiniteDuration(),
         /*write_time=*/absl::InfiniteDuration(),
         /*compute_time=*/absl::InfiniteDuration(),
-        /*exec_time=*/absl::InfiniteDuration()};
+        /*exec_time=*/absl::InfiniteDuration(),
+        /*effective_matrix_tflops=*/std::nullopt};
   }
 
   // Returns true if the estimate is guaranteed to be larger than any real
@@ -74,7 +79,7 @@ struct EstimateRunTimeData {
   bool IsInfinite() const { return exec_time == absl::InfiniteDuration(); }
 
   std::string ToString() const {
-    return absl::StrFormat(
+    std::string out = absl::StrFormat(
         "EstimateRunTimeData{\n"
         " flops: %d\n"
         " bytes_read: %d\n"
@@ -82,11 +87,15 @@ struct EstimateRunTimeData {
         " read_time: %s\n"
         " write_time: %s\n"
         " compute_time: %s\n"
-        " exec_time: %s\n"
-        "}",
+        " exec_time: %s\n",
         flops, bytes_read, bytes_written, absl::FormatDuration(read_time),
         absl::FormatDuration(write_time), absl::FormatDuration(compute_time),
         absl::FormatDuration(exec_time));
+    if (effective_matrix_tflops.has_value()) {
+      out += absl::StrFormat(" effective_matrix_tflops: %.2f\n", *effective_matrix_tflops);
+    }
+    out += "}";
+    return out;
   }
 };
 

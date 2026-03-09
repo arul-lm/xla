@@ -42,6 +42,7 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -281,9 +282,30 @@ std::string escapeCsvField(const std::string& field) {
   return escaped;
 }
 
+// Parse duration string from comp_stats (e.g. "8.64768025ms", "1.265s", "694us") to seconds.
+double ParseDurationToSeconds(const std::string &s) {
+  if (s.empty()) return 0.0;
+  const char *p = s.c_str();
+  while (*p == ' ' || *p == '\t') ++p;
+  char *end;
+  double val = std::strtod(p, &end);
+  if (end == p) return 0.0;
+  while (*end == ' ' || *end == '\t') ++end;
+  if (*end == 'n' && end[1] == 's') return val * 1e-9;
+  if (*end == 'u' && end[1] == 's') return val * 1e-6;
+  if (*end == 'm' && end[1] == 's') return val * 1e-3;
+  if (*end == 's' && (end[1] == '\0' || end[1] == ' ')) return val;
+  if (*end == 'm' && end[1] == 'i' && end[2] == 'n') return val * 60.0;
+  if (*end == 'h' && (end[1] == '\0' || end[1] == ' ')) return val * 3600.0;
+  return val;  // assume seconds if no unit
+}
+
 void writeCsv(std::ofstream &outputFile,
-              std::vector<std::vector<std::string>> data) {
-  for (const auto &row : data) {
+              const std::vector<std::vector<std::string>> &data,
+              bool include_header = true) {
+  size_t start = include_header ? 0 : 1;
+  for (size_t r = start; r < data.size(); ++r) {
+    const auto &row = data[r];
     for (size_t i = 0; i < row.size(); ++i) {
       outputFile << escapeCsvField(row[i]);
       if (i < row.size() - 1) {
@@ -294,13 +316,25 @@ void writeCsv(std::ofstream &outputFile,
   }
 }
 
-std::ofstream createCsv(std::string file_name) {
-  std::ofstream ofile(file_name, std::ios::out);
+struct CsvOut {
+  std::ofstream stream;
+  bool write_header;
+};
+
+CsvOut createCsv(const std::string &file_name, bool append = false) {
+  std::ios_base::openmode mode =
+      append ? (std::ios::out | std::ios::app) : std::ios::out;
+  std::ofstream ofile(file_name, mode);
+  bool write_header = true;
+  if (ofile.is_open() && append) {
+    std::streampos pos = ofile.tellp();
+    write_header = (pos == 0);
+  }
   if (!ofile.is_open()) {
-    llvm::outs() << "Unable to open device stats file\n";
+    llvm::outs() << "Unable to open file: " << file_name << "\n";
     llvm::outs().flush();
   }
-  return ofile;
+  return CsvOut{std::move(ofile), write_header};
 }
 
 // Relative paths under gpu_model_data_root.
@@ -514,6 +548,69 @@ std::string GetDataTypeFromInstruction(const xla::HloInstruction *instr) {
     return "f8e5m2fnuz";
   case xla::PrimitiveType::F8E4M3FNUZ:
     return "f8e4m3fnuz";
+  case xla::PrimitiveType::F4E2M1FN:
+    return "f4e2m1fn";
+  default:
+    return "unknown";
+  }
+}
+
+// Returns the datatype string used for compute/peak (for dots: first operand;
+// otherwise result type). Use this for comp_stats "datatype" so FP4/FP8/BF16
+// counts reflect the precision used for peak matrix ops.
+std::string GetComputeDataTypeFromInstruction(const xla::HloInstruction *instr) {
+  if (!instr || !instr->shape().IsArray()) {
+    return "unknown";
+  }
+  xla::PrimitiveType element_type = instr->shape().element_type();
+  if ((instr->opcode() == xla::HloOpcode::kDot ||
+       instr->opcode() == xla::HloOpcode::kRaggedDot) &&
+      instr->operand_count() >= 1 && instr->operand(0)->shape().IsArray()) {
+    element_type = instr->operand(0)->shape().element_type();
+  }
+  switch (element_type) {
+  case xla::PrimitiveType::PRED:
+    return "pred";
+  case xla::PrimitiveType::S8:
+    return "s8";
+  case xla::PrimitiveType::S16:
+    return "s16";
+  case xla::PrimitiveType::S32:
+    return "s32";
+  case xla::PrimitiveType::S64:
+    return "s64";
+  case xla::PrimitiveType::U8:
+    return "u8";
+  case xla::PrimitiveType::U16:
+    return "u16";
+  case xla::PrimitiveType::U32:
+    return "u32";
+  case xla::PrimitiveType::U64:
+    return "u64";
+  case xla::PrimitiveType::F16:
+    return "f16";
+  case xla::PrimitiveType::F32:
+    return "f32";
+  case xla::PrimitiveType::F64:
+    return "f64";
+  case xla::PrimitiveType::BF16:
+    return "bf16";
+  case xla::PrimitiveType::C64:
+    return "c64";
+  case xla::PrimitiveType::C128:
+    return "c128";
+  case xla::PrimitiveType::F8E5M2:
+    return "f8e5m2";
+  case xla::PrimitiveType::F8E4M3FN:
+    return "f8e4m3fn";
+  case xla::PrimitiveType::F8E4M3B11FNUZ:
+    return "f8e4m3b11fnuz";
+  case xla::PrimitiveType::F8E5M2FNUZ:
+    return "f8e5m2fnuz";
+  case xla::PrimitiveType::F8E4M3FNUZ:
+    return "f8e4m3fnuz";
+  case xla::PrimitiveType::F4E2M1FN:
+    return "f4e2m1fn";
   default:
     return "unknown";
   }
@@ -526,7 +623,7 @@ void AddCompStatsToCSV(std::vector<std::vector<std::string>> &comp_stats_data,
                        const xla::gpu::EstimateRunTimeData &runtime_data,
                        const std::string &device_name,
                        const xla::HloInstruction *instr,
-                       bool is_entry) {
+                       bool is_entry, const std::string &hw_arch) {
   auto delimiter = '.';
   std::vector<std::string> parts = absl::StrSplit(deduplicated_name, delimiter);
   std::string group_name;
@@ -553,15 +650,19 @@ void AddCompStatsToCSV(std::vector<std::vector<std::string>> &comp_stats_data,
   comp_stats_data.push_back(
       {std::to_string(comp_id), std::to_string(inst_count),
        std::string(deduplicated_name), op_name, group_name, std::to_string(cost),
-       std::to_string(runtime_data.flops / 1e12),        // Convert to TFLOPs
+       std::to_string(runtime_data.flops / 1e12),        // tflops: FLOPs used for compute_time, in units of 10^12
        std::to_string(runtime_data.bytes_read / 1e9),    // Convert to GB
        std::to_string(runtime_data.bytes_written / 1e9), // Convert to GB
        absl::FormatDuration(runtime_data.compute_time),
        absl::FormatDuration(runtime_data.read_time),
        absl::FormatDuration(runtime_data.write_time),
-       std::to_string(throughput), device_name,
-       GetDataTypeFromInstruction(instr),
-       is_entry ? "true" : "false"});
+       std::to_string(throughput),
+       runtime_data.effective_matrix_tflops.has_value()
+           ? std::to_string(*runtime_data.effective_matrix_tflops)
+           : "",
+       device_name,
+       GetComputeDataTypeFromInstruction(instr),
+       is_entry ? "true" : "false", hw_arch});
 }
 
 // Communication volume calculation with topology support
@@ -753,19 +854,21 @@ absl::Status RunAnalyticalLatencyCalculation(
           create_status.message()));
     }
   }
-  std::ofstream device_stats_csv =
-      createCsv(tsl::io::JoinPath(output_path, "device_stats.csv"));
-  auto comp_stats_csv =
-      createCsv(tsl::io::JoinPath(output_path, "comp_stats.csv"));
-  auto comm_stats_csv =
-      createCsv(tsl::io::JoinPath(output_path, "comm_stats.csv"));
-  auto overlap_stats_csv =
-      createCsv(tsl::io::JoinPath(output_path, "overlap_stats.csv"));
-  auto instruction_timeline_csv =
-      createCsv(tsl::io::JoinPath(output_path, "instruction_timeline.csv"));
-  if (!device_stats_csv.is_open() || !comp_stats_csv.is_open() ||
-      !comm_stats_csv.is_open() || !overlap_stats_csv.is_open() ||
-      !instruction_timeline_csv.is_open()) {
+  CsvOut device_stats_csv =
+      createCsv(tsl::io::JoinPath(output_path, "device_stats.csv"), true);
+  CsvOut comp_stats_csv =
+      createCsv(tsl::io::JoinPath(output_path, "comp_stats.csv"), false);
+  CsvOut comm_stats_csv =
+      createCsv(tsl::io::JoinPath(output_path, "comm_stats.csv"), true);
+  CsvOut overlap_stats_csv =
+      createCsv(tsl::io::JoinPath(output_path, "overlap_stats.csv"), true);
+  CsvOut instruction_timeline_csv =
+      createCsv(tsl::io::JoinPath(output_path, "instruction_timeline.csv"),
+                true);
+  if (!device_stats_csv.stream.is_open() || !comp_stats_csv.stream.is_open() ||
+      !comm_stats_csv.stream.is_open() ||
+      !overlap_stats_csv.stream.is_open() ||
+      !instruction_timeline_csv.stream.is_open()) {
     return absl::InternalError("Failed to open one or more CSV output files");
   }
 
@@ -781,7 +884,8 @@ absl::Status RunAnalyticalLatencyCalculation(
       "comp_id",      "idx",       "inst",          "op_name",     "group",
       "latency(µs)",  "tflops",    "bytes_read_gb", "bytes_written_gb",
       "compute_time", "read_time", "write_time",    "throughput_tflops_per_sec",
-      "device_name",  "datatype",  "is_entry"};
+      "effective_matrix_tflops",
+      "device_name",  "datatype",  "is_entry",      "hw_arch"};
   std::vector<std::string> comm_stats_header = {"comp_id",
                                                 "instruction_name",
                                                 "opcode",
@@ -802,7 +906,8 @@ absl::Status RunAnalyticalLatencyCalculation(
                                                 "datatype",
                                                 "num_hops",
                                                 "per_link_cost_us",
-                                                "is_entry"};
+                                                "is_entry",
+                                                "hw_arch"};
   std::vector<std::string> overlap_stats_header = {"device_name",
                                                    "overlap_factor",
                                                    "original_total_time_secs",
@@ -828,7 +933,20 @@ absl::Status RunAnalyticalLatencyCalculation(
   comm_stats_data.push_back(comm_stats_header);
   overlap_stats_data.push_back(overlap_stats_header);
   instruction_timeline_data.push_back(instruction_timeline_header);
-  std::string format = "hlo";
+
+  // Infer module format from file extension. .mlir is treated as HLO text (the
+  // file content is a HLO variant, not MLIR/MHLO). Other extensions map to
+  // their usual loader format.
+  std::string format = std::string(tsl::io::Extension(opts.hlo_module_file));
+  if (format == "mlir") {
+    format = "hlo";
+  }
+  if (format.empty() ||
+      (format != "mhlo" && format != "stablehlo" && format != "hlo" &&
+       format != "txt" && format != "pb" && format != "pbtxt")) {
+    format = "hlo";
+  }
+
   std::unique_ptr<xla::HloModule> hlo_module =
       *xla::LoadModuleFromFile(opts.hlo_module_file, format, {});
 
@@ -859,6 +977,18 @@ absl::Status RunAnalyticalLatencyCalculation(
     auto device_name = pair.first;
     stream_executor::GpuDeviceInfoProto gpu_device_info_pb = pair.second.first;
     std::string spec_file_name = pair.second.second;
+
+    // Optional: scale memory bandwidth to verify memory-bound behavior.
+    if (opts.scale_memory_bandwidth > 0.0 && opts.scale_memory_bandwidth != 1.0) {
+      int64_t bw = gpu_device_info_pb.memory_bandwidth();
+      gpu_device_info_pb.set_memory_bandwidth(static_cast<int64_t>(
+          static_cast<double>(bw) * opts.scale_memory_bandwidth));
+      llvm::outs() << "Scaled memory bandwidth by " << opts.scale_memory_bandwidth
+                   << "x (effective: "
+                   << (static_cast<double>(bw) * opts.scale_memory_bandwidth / 1e12)
+                   << " TB/s)\n";
+    }
+
     absl::StatusOr<stream_executor::DeviceDescription> gpu_device_info_result =
         stream_executor::DeviceDescription::FromProto(gpu_device_info_pb);
 
@@ -1144,7 +1274,8 @@ absl::Status RunAnalyticalLatencyCalculation(
             inst_count += 1;
             AddCompStatsToCSV(comp_stats_data, comp_count, inst_count,
                               std::string(deduplicated_name), cost,
-                              runtime_data, device_name, instr, is_entry_comp);
+                              runtime_data, device_name, instr, is_entry_comp,
+                              spec_file_name);
           }
           break;
         }
@@ -1200,7 +1331,8 @@ absl::Status RunAnalyticalLatencyCalculation(
               GetDataTypeFromInstruction(instr),
               std::to_string(comm_stats.num_hops),
               std::to_string(comm_stats.per_link_cost_us),
-              is_entry_comp ? "true" : "false"};
+              is_entry_comp ? "true" : "false",
+              spec_file_name};
           comm_stats_data.push_back(comm_row);
 
           if (cost > 0) {
@@ -1225,7 +1357,8 @@ absl::Status RunAnalyticalLatencyCalculation(
             inst_count += 1;
             AddCompStatsToCSV(comp_stats_data, comp_count, inst_count,
                               std::string(deduplicated_name), cost,
-                              runtime_data, device_name, instr, is_entry_comp);
+                              runtime_data, device_name, instr, is_entry_comp,
+                              spec_file_name);
           }
           break;
         }
@@ -1269,7 +1402,8 @@ absl::Status RunAnalyticalLatencyCalculation(
             inst_count += 1;
             AddCompStatsToCSV(comp_stats_data, comp_count, inst_count,
                               std::string(deduplicated_name), cost,
-                              runtime_data, device_name, instr, is_entry_comp);
+                              runtime_data, device_name, instr, is_entry_comp,
+                              spec_file_name);
           }
           break;
         }
@@ -1484,22 +1618,106 @@ absl::Status RunAnalyticalLatencyCalculation(
 
     llvm::outs().flush();
   }
-  writeCsv(device_stats_csv, device_stats_data);
-  writeCsv(comp_stats_csv, comp_stats_data);
-  writeCsv(comm_stats_csv, comm_stats_data);
-  writeCsv(overlap_stats_csv, overlap_stats_data);
-  writeCsv(instruction_timeline_csv, instruction_timeline_data);
-  device_stats_csv.close();
-  comp_stats_csv.close();
-  comm_stats_csv.close();
-  overlap_stats_csv.close();
-  instruction_timeline_csv.close();
+  writeCsv(device_stats_csv.stream, device_stats_data,
+           device_stats_csv.write_header);
+  writeCsv(comp_stats_csv.stream, comp_stats_data,
+           comp_stats_csv.write_header);
+
+  // Count compute ops by datatype (and hw_arch) for summary and CSV.
+  constexpr size_t kCompStatsDatatypeCol = 15;
+  constexpr size_t kCompStatsHwArchCol = 17;
+  std::map<std::string, std::map<std::string, int>> compute_op_counts;
+  for (size_t i = 1; i < comp_stats_data.size(); ++i) {
+    const auto &row = comp_stats_data[i];
+    if (row.size() > kCompStatsHwArchCol) {
+      compute_op_counts[row[kCompStatsHwArchCol]][row[kCompStatsDatatypeCol]]++;
+    }
+  }
+  CsvOut compute_op_counts_csv =
+      createCsv(tsl::io::JoinPath(output_path, "compute_op_counts.csv"), true);
+  if (compute_op_counts_csv.stream.is_open()) {
+    std::vector<std::vector<std::string>> count_data = {
+        {"hw_arch", "datatype", "count"}};
+    for (const auto &arch_pair : compute_op_counts) {
+      const std::string &hw_arch = arch_pair.first;
+      std::vector<std::string> summary_parts;
+      for (const auto &dt_pair : arch_pair.second) {
+        count_data.push_back(
+            {hw_arch, dt_pair.first, std::to_string(dt_pair.second)});
+        summary_parts.push_back(
+            absl::StrCat(dt_pair.first, "=", dt_pair.second));
+      }
+      llvm::outs() << "Compute op counts (" << hw_arch
+                   << "): " << absl::StrJoin(summary_parts, ", ") << "\n";
+    }
+    writeCsv(compute_op_counts_csv.stream, count_data,
+             compute_op_counts_csv.write_header);
+    compute_op_counts_csv.stream.close();
+  }
+
+  // Count compute-bound vs memory-bound ops from comp_stats (compute_time vs read+write).
+  constexpr size_t kCompStatsComputeTimeCol = 9;
+  constexpr size_t kCompStatsReadTimeCol = 10;
+  constexpr size_t kCompStatsWriteTimeCol = 11;
+  std::map<std::string, std::pair<int, int>> compute_bound_counts;  // hw_arch -> (compute_bound, memory_bound)
+  for (size_t i = 1; i < comp_stats_data.size(); ++i) {
+    const auto &row = comp_stats_data[i];
+    if (row.size() <= kCompStatsHwArchCol) continue;
+    double compute_sec =
+        ParseDurationToSeconds(row[kCompStatsComputeTimeCol]);
+    double read_sec = ParseDurationToSeconds(row[kCompStatsReadTimeCol]);
+    double write_sec = ParseDurationToSeconds(row[kCompStatsWriteTimeCol]);
+    std::string hw = row[kCompStatsHwArchCol];
+    if (compute_sec >= read_sec + write_sec) {
+      compute_bound_counts[hw].first++;
+    } else {
+      compute_bound_counts[hw].second++;
+    }
+  }
+  for (const auto &arch_pair : compute_bound_counts) {
+    const std::string &hw_arch = arch_pair.first;
+    int compute_bound = arch_pair.second.first;
+    int memory_bound = arch_pair.second.second;
+    llvm::outs() << "Compute-bound ops (" << hw_arch << "): " << compute_bound
+                 << ", Memory-bound ops (" << hw_arch << "): " << memory_bound
+                 << "\n";
+  }
+  CsvOut bound_stats_csv =
+      createCsv(tsl::io::JoinPath(output_path, "compute_memory_bound_stats.csv"),
+                true);
+  if (bound_stats_csv.stream.is_open()) {
+    std::vector<std::vector<std::string>> bound_data = {
+        {"hw_arch", "compute_bound", "memory_bound"}};
+    for (const auto &arch_pair : compute_bound_counts) {
+      bound_data.push_back(
+          {arch_pair.first, std::to_string(arch_pair.second.first),
+           std::to_string(arch_pair.second.second)});
+    }
+    writeCsv(bound_stats_csv.stream, bound_data, bound_stats_csv.write_header);
+    bound_stats_csv.stream.close();
+  }
+
+  writeCsv(comm_stats_csv.stream, comm_stats_data,
+           comm_stats_csv.write_header);
+  writeCsv(overlap_stats_csv.stream, overlap_stats_data,
+           overlap_stats_csv.write_header);
+  writeCsv(instruction_timeline_csv.stream, instruction_timeline_data,
+           instruction_timeline_csv.write_header);
+  device_stats_csv.stream.close();
+  comp_stats_csv.stream.close();
+  comm_stats_csv.stream.close();
+  overlap_stats_csv.stream.close();
+  instruction_timeline_csv.stream.close();
   llvm::outs() << "CSV files saved to: "
                << tsl::io::JoinPath(output_path, "device_stats.csv") << ", "
                << tsl::io::JoinPath(output_path, "comp_stats.csv") << ", "
                << tsl::io::JoinPath(output_path, "comm_stats.csv") << ", "
                << tsl::io::JoinPath(output_path, "overlap_stats.csv") << ", "
                << tsl::io::JoinPath(output_path, "instruction_timeline.csv")
+               << ", "
+               << tsl::io::JoinPath(output_path, "compute_op_counts.csv")
+               << ", "
+               << tsl::io::JoinPath(output_path, "compute_memory_bound_stats.csv")
                << "\n";
   llvm::outs() << "Done\n";
   return absl::OkStatus();

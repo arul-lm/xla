@@ -374,7 +374,7 @@ GpuPerformanceModelWithIndexingAnalysis::EstimateRunTimeForFusion(
 
   EstimateRunTimeData runtime_data = {flops,     bytes_read, bytes_written,
                                       read_time, write_time, compute_time,
-                                      exec_time};
+                                      exec_time, std::nullopt};
   VLOG(3) << "Runtime data for HLO fusion: " << fusion_adaptor.ToString()
           << "\n"
           << launch_dimensions.ToString() << "\n"
@@ -560,7 +560,8 @@ GpuPerformanceModelWithIndexingAnalysis::EstimateRunTimeForTiledHloComputation(
                              /*read_time=*/read_time,
                              /*write_time=*/write_time,
                              /*compute_time=*/compute_time,
-                             /*exec_time=*/exec_time};
+                             /*exec_time=*/exec_time,
+                             /*effective_matrix_tflops=*/std::nullopt};
 }
 
 absl::StatusOr<EstimateRunTimeData>

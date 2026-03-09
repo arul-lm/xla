@@ -26,7 +26,7 @@ gpu_device_info {
   memory_bandwidth: 22000000000000
   l2_cache_size: 132644864
   clock_rate_ghz: 1.965
-  device_memory_size: 288000000000
+  device_memory_size: 309237645312
   shared_memory_per_block_optin: 232448
   cuda_compute_capability {
     major: 10
@@ -130,7 +130,7 @@ gpu_device_info {
       value {
         clock_rate_ghz: 1.8353101
         units_per_core: 4
-        ops_per_clock: 2048
+        ops_per_clock: 1842
       }
     }
     rate_infos {
@@ -138,7 +138,7 @@ gpu_device_info {
       value {
         clock_rate_ghz: 1.8353101
         units_per_core: 4
-        ops_per_clock: 4096
+        ops_per_clock: 8057
       }
     }
     rate_infos {
@@ -146,7 +146,7 @@ gpu_device_info {
       value {
         clock_rate_ghz: 1.8353101
         units_per_core: 4
-        ops_per_clock: 8192
+        ops_per_clock: 8057
       }
     }
     rate_infos {
@@ -194,7 +194,7 @@ gpu_device_info {
       value {
         clock_rate_ghz: 1.8353101
         units_per_core: 4
-        ops_per_clock: 8192
+        ops_per_clock: 11508
       }
     }
     rate_infos {

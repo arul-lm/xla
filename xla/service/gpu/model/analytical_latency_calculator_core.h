@@ -38,6 +38,12 @@ struct AnalyticalLatencyCalculatorOpts {
   bool dump_modified_module;
   /** Root for model data (specs + cluster configs). Required. */
   std::string gpu_model_data_root;
+  /**
+   * Scale factor for memory bandwidth (default 1.0). Used to verify
+   * memory-bound behavior: e.g. 10.0 = 10x bandwidth → if total time
+   * drops a lot, the workload is memory-bound.
+   */
+  double scale_memory_bandwidth = 1.0;
 };
 
 // Runs the analytical latency calculation: loads the HLO module, runs

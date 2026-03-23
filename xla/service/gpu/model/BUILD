@@ -473,6 +473,53 @@ cc_binary(
 )
 
 cc_library(
+    name = "batch_size_modifier_lib",
+    srcs = [
+        "batch_size_modifier_detect.cc",
+        "batch_size_modifier_modify.cc",
+        "batch_size_modifier_run.cc",
+    ],
+    hdrs = [
+        "batch_size_modifier_core.h",
+        "batch_size_modifier_internal.h",
+        "batch_size_modifier_modify.h",
+    ],
+    deps = [
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:errors",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
+    name = "batch_size_modifier_ffi",
+    srcs = ["batch_size_modifier_ffi.cc"],
+    hdrs = ["batch_size_modifier_c.h"],
+    alwayslink = True,
+    deps = [
+        ":batch_size_modifier_lib",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+xla_cc_binary(
+    name = "batch_size_modifier",
+    srcs = ["batch_size_modifier_main.cc"],
+    deps = [
+        ":batch_size_modifier_lib",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@tsl//tsl/platform:platform_port",
+    ],
+)
+
+cc_library(
     name = "analytical_latency_calculator_ffi",
     srcs = ["analytical_latency_calculator_ffi.cc"],
     hdrs = ["analytical_latency_calculator_c.h"],
@@ -501,8 +548,22 @@ cc_binary(
         "//xla/service/gpu/model/configs:all_configs",
     ],
     deps = [
+        ":batch_size_modifier_ffi",
         ":peak_matrix_ops_shard",
         ":analytical_latency_calculator_ffi",
+    ],
+)
+
+xla_cc_test(
+    name = "batch_size_modifier_test",
+    srcs = ["batch_size_modifier_test.cc"],
+    deps = [
+        ":batch_size_modifier_lib",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:env",
+        "@com_google_googletest//:gtest_main",
+        "@tsl//tsl/platform:path",
+        "@tsl//tsl/platform:test",
     ],
 )
 

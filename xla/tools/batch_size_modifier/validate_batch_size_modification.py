@@ -64,6 +64,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import yaml
@@ -648,16 +649,17 @@ def modify_mlir_file(modifier_bin: Path, input_mlir: Path, output_mlir: Path,
     except Exception as e:
         raise RuntimeError(f"Failed to create vinveli config file: {e}")
     
+    # TSL Flags::Parse only accepts --flag=value for string/int flags (not "--flag value").
     cmd = [
         str(modifier_bin),
-        '--input', str(input_mlir),
-        '--output', str(output_mlir),
-        '--old-batch-size', str(old_batch_size),
-        '--new-batch-size', str(new_batch_size),
-        '--config', str(vinveli_config_path),
-        '--mesh-inference-path', str(input_mlir),
-        '--comm-stats-csv', str(comm_stats_csv),
-        '--comp-stats-csv', str(comp_stats_csv),
+        f'--input={input_mlir}',
+        f'--output={output_mlir}',
+        f'--old-batch-size={old_batch_size}',
+        f'--new-batch-size={new_batch_size}',
+        f'--config={vinveli_config_path}',
+        f'--mesh-inference-path={input_mlir}',
+        f'--comm-stats-csv={comm_stats_csv}',
+        f'--comp-stats-csv={comp_stats_csv}',
     ]
     
     print(f"  Running: {' '.join(cmd)}")
@@ -687,32 +689,67 @@ def modify_mlir_file(modifier_bin: Path, input_mlir: Path, output_mlir: Path,
         raise FileNotFoundError(f"Modified MLIR file was not created: {output_mlir}")
 
 
-def copy_mlir_to_container(mlir_file: Path, xla_container_path: str, container_name: str = "xla") -> str:
-    """Copy MLIR file to XLA container."""
-    container_dir = f"{xla_container_path}/{mlir_file.parent.name}"
-    container_file_path = f"{container_dir}/{mlir_file.name}"
-    
-    # Create directory in container
+def canonical_hlo_dir_name_from_sdy_row(row: dict, model_name: str = "deepseek_r1") -> str:
+    """HLO directory name under /xla/hlo, matching vinveli run_analytical_latency_batch.py."""
+    quant_val = row.get("quant", "False")
+    quant_bool = str(quant_val).lower() in ("true", "1", "yes", "on")
+    quant_str = "q1" if quant_bool else "q0"
+    dtype = str(row["dtype"]).lower()
+    batch_size = row["batch_size"]
+    seq_len = row["seq_len"]
+    mesh_shape = row["mesh_shape"]
+    strategy = str(row.get("strategy", "prefill")).lower()
+    inf_stage = "dec" if strategy == "decode" else "pre"
+    return (
+        f"hlo_{inf_stage}_{model_name}_{quant_str}_{dtype}_{batch_size}_"
+        f"{seq_len}_{mesh_shape}"
+    )
+
+
+def copy_mlir_to_container(
+    mlir_file: Path,
+    xla_container_path: str,
+    container_name: str = "xla",
+    *,
+    container_subdir: Optional[str] = None,
+    dest_basename: Optional[str] = None,
+) -> str:
+    """Copy MLIR file to the XLA container.
+
+    run_analytical_latency_batch.py always passes
+    ``/xla/hlo/<hlo_pre|dec>_deepseek_r1_...>/<model>.mlir`` to the calculator.
+    Modified modules often live under ``.../modified_mlir/modified_batch_N.mlir`` on
+    the host; they must be copied into that canonical HLO path, not under
+    ``modified_mlir``, or the calculator still reads the previous module.
+    """
+    if container_subdir is not None:
+        fname = dest_basename if dest_basename else mlir_file.name
+        container_dir = f"{xla_container_path}/{container_subdir}"
+    else:
+        container_dir = f"{xla_container_path}/{mlir_file.parent.name}"
+        fname = mlir_file.name
+    container_file_path = f"{container_dir}/{fname}"
+
     result = subprocess.run(
         ["docker", "exec", container_name, "mkdir", "-p", container_dir],
         check=True,
         capture_output=True,
-        text=True
+        text=True,
     )
-    
-    # Copy file to container
+
     result = subprocess.run(
         ["docker", "cp", str(mlir_file), f"{container_name}:{container_file_path}"],
         check=True,
         capture_output=True,
-        text=True
+        text=True,
     )
-    
+
     return container_file_path
 
 
 def copy_mlir_files_from_csv(sdy_gen_csv: Path, mlir_files: Dict[int, Path], 
-                             xla_container_path: str, container_name: str = "xla") -> List[str]:
+                             xla_container_path: str, container_name: str = "xla",
+                             model_name: str = "deepseek_r1") -> List[str]:
     """Copy MLIR files to container based on CSV entries.
     
     Checks if files exist before copying and reports any missing files.
@@ -732,7 +769,15 @@ def copy_mlir_files_from_csv(sdy_gen_csv: Path, mlir_files: Dict[int, Path],
                     print(f"  ⚠️  Warning: MLIR file not found for batch_size={batch_size}: {mlir_file}")
                     continue
                 
-                container_path = copy_mlir_to_container(mlir_file, xla_container_path, container_name)
+                hlo_subdir = canonical_hlo_dir_name_from_sdy_row(row, model_name=model_name)
+                dest_name = f"{model_name}.mlir"
+                container_path = copy_mlir_to_container(
+                    mlir_file,
+                    xla_container_path,
+                    container_name,
+                    container_subdir=hlo_subdir,
+                    dest_basename=dest_name,
+                )
                 container_paths.append(container_path)
                 print(f"  ✓ Copied: {mlir_file.name} -> {container_path}")
             else:
@@ -759,6 +804,17 @@ def run_analytical_latency_batch(vinveli_home: Path, sdy_gen_csv: Path, stats_di
     print(f"\n[DEBUG] run_analytical_latency_batch will search for MLIR files in: {vinveli_home / 'hlo'}")
     print(f"[DEBUG]   It reads the CSV file and constructs MLIR paths based on CSV entries")
     print(f"[DEBUG]   CSV file: {sdy_gen_csv}")
+
+    # Clean local and container stats directories to prevent stale rows accumulating
+    local_stats = vinveli_home / stats_dir_name
+    if local_stats.exists():
+        shutil.rmtree(local_stats)
+    local_stats.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["docker", "exec", "xla", "rm", "-rf", f"/xla/{stats_dir_name}"],
+        capture_output=True, text=True,
+    )
+
     sdy_gen_abs_path = sdy_gen_csv.absolute()
     
     cmd = [
@@ -918,11 +974,10 @@ def _extract_latency_by_hw_arch_from_dataframe(stats_df: pd.DataFrame) -> Dict[s
     if not latency_col:
         return {}
     
-    # Group by hw_arch and sum latencies (in case there are multiple devices per arch)
+    # Group by hw_arch; use mean to be robust to duplicate rows from repeated runs
     for hw_arch in stats_df['hw_arch'].unique():
         arch_df = stats_df[stats_df['hw_arch'] == hw_arch]
-        # Sum latencies for all devices with this hw_arch
-        total_latency_secs = arch_df[latency_col].sum()
+        total_latency_secs = arch_df[latency_col].mean()
         # Convert to milliseconds if in seconds
         if latency_col.endswith('_secs') or total_latency_secs < 1000:
             latency_ms = total_latency_secs * 1000
@@ -1136,69 +1191,65 @@ def main():
     print("Step 3: Generating modified MLIR files using modify batch size script")
     print(f"{'='*60}")
     
-    # Find reference MLIR file (with max_batch_size)
-    # NOTE: max_batch_size is used as the reference (old_batch_size) for modification
-    reference_mlir = find_mlir_file(vinveli_home, args.max_batch_size, args.seq_len,
-                                    args.strategy, args.mesh_shape, args.dtype, args.quant)
-    
-    if not reference_mlir:
-        print(f"⚠️  Error: Reference MLIR file not found for batch_size={args.max_batch_size}")
-        print(f"   This file should have been generated in Step 1.")
-        return 1
-    
-    print(f"✓ Found reference MLIR file: {reference_mlir}")
-    print(f"  Using this as input to modify batch size script")
-    print(f"  Reference batch_size (old_batch_size) = {args.max_batch_size}")
-    
-    # Find CSV stats files for the reference batch_size (max_batch_size)
-    # These are required by the modify batch size script
-    print(f"\nFinding CSV stats files for reference batch_size={args.max_batch_size}...")
-    comm_stats_csv, comp_stats_csv = find_stats_csv_files(
-        stats_dir_original_actual, args.max_batch_size, args.seq_len,
-        args.strategy, args.mesh_shape, args.dtype, args.quant
-    )
-    
-    if comm_stats_csv is None:
-        print(f"⚠️  Error: comm_stats.csv not found for batch_size={args.max_batch_size}")
-        print(f"   Searched in: {stats_dir_original_actual}")
-        print(f"   This file is required by the modify batch size script")
-        return 1
-    
-    if comp_stats_csv is None:
-        print(f"⚠️  Error: comp_stats.csv not found for batch_size={args.max_batch_size}")
-        print(f"   Searched in: {stats_dir_original_actual}")
-        print(f"   This file is required by the modify batch size script")
-        return 1
-    
-    print(f"✓ Found comm_stats.csv: {comm_stats_csv}")
-    print(f"✓ Found comp_stats.csv: {comp_stats_csv}")
-    print(f"  These will be passed to batch_size_modifier")
+    # Group batch sizes by MLIR structure so that the modifier uses a reference
+    # with the same graph topology as each target.  The XLA compiler can emit
+    # structurally different HLO for different batch sizes (e.g. ring-attention
+    # conditionals appear only above a certain threshold).  Text-level dimension
+    # substitution preserves instruction count, so comparing a modified file
+    # against a natively-generated one that has a different instruction count
+    # produces a phantom latency gap.  Grouping by line count avoids this.
+    print("\nGrouping batch sizes by MLIR structure (line count)...")
+    line_counts: Dict[int, int] = {}
+    for bs, mlir_path in original_mlir_files.items():
+        with open(mlir_path) as f:
+            line_counts[bs] = sum(1 for _ in f)
+
+    # Build groups: map line_count → sorted list of batch sizes
+    structure_groups: Dict[int, list] = defaultdict(list)
+    for bs in sorted(line_counts):
+        structure_groups[line_counts[bs]].append(bs)
+
+    for lc, members in sorted(structure_groups.items()):
+        ref_bs = max(members)
+        print(f"  Structure class (lines={lc}): batch_sizes={members}, reference={ref_bs}")
     
     modified_mlir_dir = output_dir / "modified_mlir"
     modified_mlir_dir.mkdir(parents=True, exist_ok=True)
     
     modified_mlir_files = {}
-    for batch_size in batch_sizes:
-        print(f"\nProcessing batch_size={batch_size}...")
-        
-        modified_mlir = modified_mlir_dir / f"modified_batch_{batch_size}.mlir"
-        
-        try:
-            # Use max_batch_size as old_batch_size (reference) and current batch_size as new_batch_size
-            # Pass the CSV files from the reference batch_size
-            modify_mlir_file(modifier_bin, reference_mlir, modified_mlir,
-                            args.max_batch_size, batch_size, config_path,
-                            args.strategy, args.seq_len, args.mesh_shape,
-                            comm_stats_csv, comp_stats_csv, vinveli_home)
-            # Verify file was created
-            if modified_mlir.exists():
-                modified_mlir_files[batch_size] = modified_mlir
-                print(f"  ✓ Generated modified MLIR: {modified_mlir}")
-            else:
-                print(f"  ⚠️  Warning: Modified MLIR file was not created: {modified_mlir}")
-        except Exception as e:
-            print(f"  ⚠️  Warning: Failed to modify MLIR for batch_size={batch_size}: {e}")
+    for _lc, members in sorted(structure_groups.items()):
+        ref_bs = max(members)
+        reference_mlir = original_mlir_files.get(ref_bs)
+        if not reference_mlir:
+            print(f"\n⚠️  Skipping group with reference batch_size={ref_bs}: MLIR not found")
             continue
+
+        comm_stats_csv, comp_stats_csv = find_stats_csv_files(
+            stats_dir_original_actual, ref_bs, args.seq_len,
+            args.strategy, args.mesh_shape, args.dtype, args.quant
+        )
+        if comm_stats_csv is None or comp_stats_csv is None:
+            print(f"\n⚠️  Skipping group with reference batch_size={ref_bs}: stats CSVs not found")
+            continue
+
+        print(f"\nUsing reference batch_size={ref_bs} (comm_stats: {comm_stats_csv.name}, comp_stats: {comp_stats_csv.name})")
+
+        for batch_size in members:
+            print(f"  Processing batch_size={batch_size}...")
+            modified_mlir = modified_mlir_dir / f"modified_batch_{batch_size}.mlir"
+            try:
+                modify_mlir_file(modifier_bin, reference_mlir, modified_mlir,
+                                ref_bs, batch_size, config_path,
+                                args.strategy, args.seq_len, args.mesh_shape,
+                                comm_stats_csv, comp_stats_csv, vinveli_home)
+                if modified_mlir.exists():
+                    modified_mlir_files[batch_size] = modified_mlir
+                    print(f"    ✓ Generated modified MLIR: {modified_mlir}")
+                else:
+                    print(f"    ⚠️  Warning: Modified MLIR file was not created: {modified_mlir}")
+            except Exception as e:
+                print(f"    ⚠️  Warning: Failed to modify MLIR for batch_size={batch_size}: {e}")
+                continue
     
     # Step 4: Create CSV for modified files and copy to container
     print(f"\n{'='*60}")

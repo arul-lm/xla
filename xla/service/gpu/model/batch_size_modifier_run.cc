@@ -146,23 +146,24 @@ LoadInstructionCsv(const std::string& path) {
   int idx_opcode = -1;
   for (size_t i = 0; i < headers.size(); ++i) {
     std::string h = std::string(absl::StripAsciiWhitespace(headers[i]));
-    if (h == "instruction_name") idx_name = static_cast<int>(i);
-    if (h == "opcode") idx_opcode = static_cast<int>(i);
+    if (h == "instruction_name" || h == "inst") idx_name = static_cast<int>(i);
+    if (h == "opcode" || h == "group") idx_opcode = static_cast<int>(i);
   }
-  if (idx_name < 0 || idx_opcode < 0) {
-    return absl::InvalidArgumentError(
-        "CSV must contain instruction_name and opcode columns");
+  if (idx_name < 0) {
+    return out;  // No name column — treat CSV as empty (matches Python behavior)
   }
   std::string row;
   while (std::getline(f, row)) {
     std::vector<std::string> cells = split_csv(row);
-    if (static_cast<int>(cells.size()) <= std::max(idx_name, idx_opcode)) {
+    if (static_cast<int>(cells.size()) <= idx_name) {
       continue;
     }
     std::string name =
         std::string(absl::StripAsciiWhitespace(cells[idx_name]));
-    std::string opcode =
-        std::string(absl::StripAsciiWhitespace(cells[idx_opcode]));
+    std::string opcode;
+    if (idx_opcode >= 0 && static_cast<int>(cells.size()) > idx_opcode) {
+      opcode = std::string(absl::StripAsciiWhitespace(cells[idx_opcode]));
+    }
     if (name.empty()) continue;
     out[name] = CsvInstructionRow{opcode};
   }

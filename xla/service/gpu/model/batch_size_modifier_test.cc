@@ -59,6 +59,39 @@ TEST(BatchSizeModifierTest, RewritesExplicitBatchDimension) {
   EXPECT_NE(out.find("f32[8,4]"), std::string::npos);
 }
 
+TEST(BatchSizeModifierTest, RewritesEveryExplicitBatchDimensionInShape) {
+  std::string tmp = tsl::testing::TmpDir();
+  std::string yaml = tsl::io::JoinPath(tmp, "cfg2.yaml");
+  std::string in_path = tsl::io::JoinPath(tmp, "case2_1x2x1.mlir");
+  std::string out_path = tsl::io::JoinPath(tmp, "out2.mlir");
+
+  TF_EXPECT_OK(tsl::WriteStringToFile(tsl::Env::Default(), yaml,
+                                      R"(modify_batch_size:
+  num_experts: 8
+  seq_len: 4
+  num_experts_per_tok: 2
+  sp: 1
+)"));
+  TF_EXPECT_OK(tsl::WriteStringToFile(tsl::Env::Default(), in_path,
+                                      "%x = f32[2,2,4] parameter(0)\n"));
+
+  BatchSizeModifierOptions opts;
+  opts.input_mlir_path = in_path;
+  opts.output_mlir_path = out_path;
+  opts.old_batch_size = 2;
+  opts.new_batch_size = 8;
+  opts.config_yaml_path = yaml;
+  opts.path_for_mesh_inference = in_path;
+  opts.enable_reshape_fix = true;
+  opts.strict_mode = false;
+
+  TF_EXPECT_OK(RunBatchSizeModification(opts));
+
+  std::string out;
+  TF_EXPECT_OK(tsl::ReadFileToString(tsl::Env::Default(), out_path, &out));
+  EXPECT_NE(out.find("f32[8,8,4]"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace gpu
 }  // namespace xla

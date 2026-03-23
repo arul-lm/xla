@@ -175,7 +175,6 @@ std::optional<std::vector<int>> CalculateNewDimensions(
       if (dimensions[i] == old_batch) {
         new_dims[i] = new_batch;
         modified = true;
-        break;
       }
     }
   } else if (det.has_folded_batch && det.folded_dimension >= 0 &&
@@ -533,42 +532,55 @@ std::string BatchSizeModifier::ReplaceConstantsAndSlices(const std::string& line
     }
   }
 
-  static const std::regex dyn_re(R"(dynamic_slice_sizes=\{([^}]+)\})");
-  struct DynRep {
-    size_t pos;
-    size_t len;
-    std::string text;
-  };
-  std::vector<DynRep> dyn_reps;
-  for (std::sregex_iterator it(out.begin(), out.end(), dyn_re), end;
-       it != end; ++it) {
-    const std::smatch& m = *it;
-    std::vector<int> dims = ParseDimensionInts(m[1].str());
-    if (dims.empty()) continue;
-    std::vector<int> new_dims;
-    bool modified = false;
-    for (int dim : dims) {
-      Detection det = DetectDimensions(config_, old_batch_size_, {dim});
-      auto nd = CalculateNewDimensions(config_, old_batch_size_,
+  // Handles both dynamic_slice_sizes={...} and slice_sizes={...} (gather ops).
+  auto ReplaceBracedDimList = [&](const std::string& input,
+                                  const std::regex& re,
+                                  const std::string& attr_name)
+      -> std::string {
+    struct BRep {
+      size_t pos;
+      size_t len;
+      std::string text;
+    };
+    std::vector<BRep> breps;
+    for (std::sregex_iterator it(input.begin(), input.end(), re), end;
+         it != end; ++it) {
+      const std::smatch& m = *it;
+      std::vector<int> dims = ParseDimensionInts(m[1].str());
+      if (dims.empty()) continue;
+      std::vector<int> new_dims;
+      bool modified = false;
+      for (int dim : dims) {
+        Detection det = DetectDimensions(config_, old_batch_size_, {dim});
+        auto nd = CalculateNewDimensions(config_, old_batch_size_,
                                          new_batch_size_, {dim}, det);
-      if (nd.has_value() && (*nd)[0] != dim) {
-        new_dims.push_back((*nd)[0]);
-        modified = true;
-      } else {
-        new_dims.push_back(dim);
+        if (nd.has_value() && (*nd)[0] != dim) {
+          new_dims.push_back((*nd)[0]);
+          modified = true;
+        } else {
+          new_dims.push_back(dim);
+        }
       }
+      if (!modified) continue;
+      breps.push_back(
+          {static_cast<size_t>(m.position(0)),
+           static_cast<size_t>(m.length(0)),
+           absl::StrCat(attr_name, "={", absl::StrJoin(new_dims, ","), "}")});
     }
-    if (!modified) continue;
-    dyn_reps.push_back(
-        {static_cast<size_t>(m.position(0)), static_cast<size_t>(m.length(0)),
-         absl::StrCat("dynamic_slice_sizes={", absl::StrJoin(new_dims, ","),
-                      "}")});
-  }
-  std::sort(dyn_reps.begin(), dyn_reps.end(),
-            [](const DynRep& a, const DynRep& b) { return a.pos > b.pos; });
-  for (const DynRep& r : dyn_reps) {
-    out.replace(r.pos, r.len, r.text);
-  }
+    std::sort(breps.begin(), breps.end(),
+              [](const BRep& a, const BRep& b) { return a.pos > b.pos; });
+    std::string result = input;
+    for (const BRep& r : breps) {
+      result.replace(r.pos, r.len, r.text);
+    }
+    return result;
+  };
+
+  static const std::regex dyn_re(R"(dynamic_slice_sizes=\{([^}]+)\})");
+  out = ReplaceBracedDimList(out, dyn_re, "dynamic_slice_sizes");
+
+  static const std::regex slice_sizes_re(R"(slice_sizes=\{([^}]+)\})");
+  out = ReplaceBracedDimList(out, slice_sizes_re, "slice_sizes");
 
   return out;
 }

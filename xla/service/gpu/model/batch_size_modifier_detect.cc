@@ -113,10 +113,10 @@ void IdentifyBatchSizeInDimensions(
           *pattern = "batch_size*seq_len_sharded";
           return;
         }
-        *batch_folded = true;
-        *folded_dim = static_cast<int>(i);
-        *pattern = "batch_size*seq_len_sharded";
-        return;
+        // Do not treat oversized dims as batch*seq_sharded (aligns with
+        // intended analyze_batch_size_dimensions semantics; avoids false
+        // positives on unrelated large leading dimensions).
+        continue;
       }
     }
   }

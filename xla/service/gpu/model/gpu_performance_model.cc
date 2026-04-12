@@ -135,6 +135,7 @@ bool IsRubin(const stream_executor::DeviceDescription& device_info) {
   auto name = device_info.name();
   std::string lower_name = absl::AsciiStrToLower(name);
   return absl::StrContains(lower_name, "r200") ||
+         absl::StrContains(lower_name, "r576") ||
          absl::StrContains(lower_name, "rcpx");
 }
 

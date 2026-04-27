@@ -19,8 +19,8 @@ Dense tensor-core **PFLOPS** match the matrix-unit formula in each row’s **dev
 | `b300l200` | 3.5 | 7 | 14 | 1,152 | 3,600 | 50 | 921,600 | 100 | 7.94 | 288 |
 | `r200` | 4 | 17.5 | 25 | 72 | 1,800 | 100 | 57,600 | 100 | 22 | 288 |
 | `r200l200` | 4 | 17.5 | 25 | 1,152 | 7,800 | 100 | 921,600 | 100 | 22 | 288 |
-| `r576` | 8 | 35 | 50 | 576 | 1,800 | 100 | 57,600 | 100 | 22 | 288 |
-| `r576l200` | 8 | 35 | 50 | 1,152 | 7,200 | 100 | 921,600 | 100 | 22 | 288 |
+| `r576` | 8 | 35 | 50 | 576 | 1,800 | 100 | 57,600 | 100 | 53 | 1,024 |
+| `r576l200` | 8 | 35 | 50 | 1,152 | 7,200 | 100 | 921,600 | 100 | 53 | 1,024 |
 
 **Definitions:** **Scale-up aggregate** = `scaleup_fabric_port_count × scaleup_fabric_link_bw_gbytes` (all2all fabric model in `cluster_config.cc`). **Scale-out aggregate / SU** = `compute_rack_count × compute_trays_per_rack × nic_per_tray × nic_speed_gbytes`. **HBM** from `device_memory_size` and `memory_bandwidth` in the matching `*.txtpb` (GiB / TB/s rounded like the tables below).
 
@@ -54,8 +54,8 @@ Dense tensor-core TFLOPS below follow the matrix-unit formula in the spec (same 
 | b300l200 | `b300l200.txtpb` | ~288 | ~7.94 | 158 | ~3.5 | ~7 | ~14 |
 | r200 | `r200.txtpb` | ~288 | ~22 | 148 | ~4 | ~17.5 | ~25 |
 | r200l200 | `r200l200.txtpb` | ~288 | ~22 | 148 | ~4 | ~17.5 | ~25 |
-| r576 | `r576.txtpb` | ~288 | ~22 | 148 | ~8 | ~35 | ~50 |
-| r576l200 | `r576l200.txtpb` | ~288 | ~22 | 148 | ~8 | ~35 | ~50 |
+| r576 | `r576.txtpb` | ~1,024 | ~53 | 148 | ~8 | ~35 | ~50 |
+| r576l200 | `r576l200.txtpb` | ~1,024 | ~53 | 148 | ~8 | ~35 | ~50 |
 
 **r576** is Rubin-class like **r200** but with **2×** `matrix_unit_description.ops_per_clock` vs `r200.txtpb` (dense FLOPS doubled in the spec).
 
@@ -71,7 +71,7 @@ Values aligned to vendor-published dense TFLOPS for **r200 / b200 / b300**. Spar
 | b300   | 3,500         | 7,000                    | 14,000     | 14,000             | 28,000     |
 
 - **r200 (Rubin):** BF16 4 PFLOPS, FP8 17.5 PFLOPS, NVFP4 25 PFLOPS dense (before the model’s extra 2× sparse path).
-- **r576:** Same memory subsystem as r200 in the spec; **2×** dense matrix peaks vs r200 (see `r576.txtpb`).
+- **r576:** HBM in `r576.txtpb` is **1 TiB / 53 TB/s** (vs r200’s ~288 GiB / ~22 TB/s); **2×** dense matrix peaks vs r200 (see `r576.txtpb`).
 - **b200 (Blackwell):** Per [Spheron B300 guide](https://www.spheron.network/blog/nvidia-b300-blackwell-ultra-guide/) (B200 column).
 - **b300 (Blackwell Ultra):** Per same guide (B300 column).
 
@@ -107,9 +107,9 @@ From `target_config/specs/*.txtpb` `device_memory_size` (bytes → GB).
 | b200     | 178              |
 | b300     | 288              |
 | r200     | 288              |
-| r576     | 288              |
+| r576     | 1,024            |
 
-`*l200` device files match the same chip (e.g. `r576l200` = 288 GiB like `r576`).
+`*l200` device files match the same chip (e.g. `r576l200` = 1 TiB like `r576`).
 
 ---
 
@@ -122,7 +122,7 @@ From `target_config/specs/*.txtpb` `memory_bandwidth` (bytes/s → TB/s). Per-de
 | b200     | 7.67                     |
 | b300     | 7.94                     |
 | r200     | 22                       |
-| r576     | 22                       |
+| r576     | 53                       |
 
 ---
 
@@ -138,8 +138,8 @@ Total device memory in one scale-up domain: `scaleup_switch_port_count × device
 | b300l200   | 1,152                      | 288                     | 331,776                     |
 | r200       | 72                         | 288                     | 20,736                      |
 | r200l200   | 1,152                      | 288                     | 331,776                     |
-| r576       | 576                        | 288                     | 165,888                     |
-| r576l200   | 1,152                      | 288                     | 331,776                     |
+| r576       | 576                        | 1,024                   | 589,824                     |
+| r576l200   | 1,152                      | 1,024                   | 1,179,648                   |
 
 ---
 

@@ -14,6 +14,7 @@
 #
 # Rubin-class target derived from r200.txtpb: all matrix_unit_description
 # ops_per_clock values are doubled (2x dense tensor-core FLOPS vs r200).
+# Per-GPU HBM: 1 TiB capacity, 53 TB/s bandwidth (r200 .txtpb: ~288 GiB, ~22 TB/s).
 
 gpu_device_info {
   threads_per_block_limit: 1024
@@ -26,10 +27,10 @@ gpu_device_info {
   block_dim_limit_x: 2147483647
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
-  memory_bandwidth: 22000000000000
+  memory_bandwidth: 53000000000000
   l2_cache_size: 132644864
   clock_rate_ghz: 1.965
-  device_memory_size: 309237645312
+  device_memory_size: 1099511627776
   shared_memory_per_block_optin: 232448
   cuda_compute_capability {
     major: 10

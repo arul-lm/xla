@@ -17,14 +17,25 @@ namespace stream_executor {
 // Forward declaration for CommCostStats
 struct CommCostStats;
 
-// Path component types for GPU communication
+// Path component types for GPU communication.
+//
+// The first six entries (GPU..CoreSwitch) are used by GpuClusterConfig and
+// must keep their current ordering. The remaining four entries (L1Switch..
+// ToRSwitch) are used exclusively by CalciumClusterConfig to model the q250
+// 4-level PCIe + L4 Ethernet fabric. They are unreachable from
+// GpuClusterConfig::PathBetweenDevices (which only emits the first six),
+// so existing arch behavior (TPU, B200, B300, R200, R576, RCPX) is unaffected.
 enum class PathComponent {
     GPU,
     NvSwitch,
     NIC,
     RailSwitch,
     SpineSwitch,
-    CoreSwitch
+    CoreSwitch,
+    L1Switch,    // Calcium: PCIe Gen5 x16 SoC <-> L1 switch (intra-pod)
+    L2Switch,    // Calcium: PCIe Gen6 x32 L1 <-> L2 switch (intra-card)
+    L3Switch,    // Calcium: PCIe Gen6 x64 L2 <-> L3 switch (intra-server)
+    ToRSwitch    // Calcium: Ethernet RoCE v2 NIC <-> ToR switch (inter-server)
 };
 
 // Communication type enum for node-level analysis
@@ -243,6 +254,110 @@ public:
     std::vector<double> PathToBandwidth(const std::vector<PathComponent>& path) const;
     CommType DetermineCommTypeFromPath(const std::vector<PathComponent>& path) const;
     std::pair<int, int> CountHopsByDomain(const std::vector<PathComponent>& path) const;
+};
+
+// Calcium (q250) physical coordinate: a single SoC's location in the
+// server -> card -> L1-pod -> SoC-in-pod hierarchy. Used by
+// CalciumClusterConfig::DecodeId and PathBetweenDevices.
+struct CalciumCoord {
+    int server;       // 0..N-1
+    int card;         // 0..7  (8 cards per server)
+    int l1_pod;       // 0..2  (3 L1 pods per card)
+    int soc_in_pod;   // 0..7  (8 SoCs per L1 pod)
+};
+
+// CalciumClusterConfig: 4-level fabric (L1/L2/L3 PCIe + L4 Ethernet RoCE v2)
+// for the non-CUDA Calcium accelerator (q250). Models intra-pod, intra-card,
+// intra-server, and inter-server collective costs with explicit
+// oversubscription and replica-group contention sharing.
+class CalciumClusterConfig : public ClusterConfig {
+private:
+    std::string name_pattern_;
+
+    // L1: PCIe Gen5 x16 SoC <-> L1Switch.
+    int    l1_pod_size_;             // 8 SoCs per L1 pod
+    double l1_link_bw_gbytes_;       // 64 GB/s UNI
+    double l1_oversubscription_;     // 1.0 (non-blocking)
+
+    // L2: PCIe Gen6 x32 L1Switch <-> L2Switch.
+    int    l1_pods_per_card_;        // 3 L1 pods per card
+    double l2_link_bw_gbytes_;       // 256 GB/s UNI
+    double l2_oversubscription_;     // 2.0 (8 SoCs share per L2 uplink)
+
+    // L3: PCIe Gen6 x64 L2Switch <-> L3Switch.
+    int    cards_per_server_;        // 8 cards per server
+    double l3_link_bw_gbytes_;       // 512 GB/s UNI
+    double l3_oversubscription_;     // ~3.0 (24 SoCs share L3 fabric)
+
+    // L4: Ethernet RoCE v2 NIC <-> ToR <-> NIC.
+    double host_nic_link_bw_gbytes_; // 800 GB/s aggregate
+    double l4_per_card_egress_gbytes_; // 100 GB/s per card (the 5.12:1 cliff)
+    double tor_switch_uplink_gbytes_;  // 800 GB/s
+
+    // Efficiency factors.
+    double intranode_efficiency_factor_;
+    double internode_efficiency_factor_;
+
+    // Device-id layout convention. Only "row_major_socs_first" supported today.
+    std::string device_id_layout_;
+
+public:
+    CalciumClusterConfig();
+    virtual ~CalciumClusterConfig() = default;
+
+    // ClusterConfig interface implementation.
+    std::string GetNamePattern() const override;
+    bool LoadFromFile(const std::string& config_file_path) override;
+    CommCostStats CalculateCommCost(double per_device_comm_volume,
+        const stream_executor::DeviceDescription& device_info,
+        const xla::HloInstruction* instr,
+        uint64_t replica_group_size,
+        uint64_t num_replica_groups,
+        const std::vector<int64_t>& device_ids,
+        const std::vector<int>& mesh_shape,
+        const std::string& hardware_architecture,
+        const std::string& fallback_device_type) override;
+
+    // Calcium-specific public interface.
+    // Decode a flat device ID into physical coordinates.
+    // Layout: id = server*192 + card*24 + l1_pod*8 + soc_in_pod.
+    CalciumCoord DecodeId(int64_t id) const;
+
+    // Return the 2/4/6/10-hop path between two SoCs based on the LCA of
+    // their physical coordinates.
+    std::vector<PathComponent> PathBetweenDevices(int64_t src, int64_t dst) const;
+
+    // Static link bandwidth (GB/s) for a single hop (src, dst). Pure topology.
+    // Used for --dump_path_trace parity check vs. the rack-level trace.
+    double StaticLinkBandwidth(PathComponent a, PathComponent b) const;
+
+    // Static topological oversubscription factor for a hop.
+    double StaticOversubscription(PathComponent a, PathComponent b) const;
+
+    // Effective per-SoC bandwidth on a hop after both topological
+    // oversubscription and dynamic replica-group sharing. devices_sharing
+    // is the count of SoCs in the replica group that traverse the same
+    // switch uplink at this hop.
+    double EffectiveBandwidth(PathComponent a, PathComponent b,
+                              int devices_sharing) const;
+
+    // For each hop in the path, compute how many SoCs in `device_ids`
+    // share the bottleneck switch uplink.
+    int ComputeDevicesSharingHop(PathComponent a, PathComponent b,
+                                 const std::vector<int64_t>& device_ids) const;
+
+    // Step 8 (PP): inter-stage handoff cost between rank-0 SoC of stage 0
+    // and rank-0 SoC of stage 1. Uses PathBetweenDevices + EffectiveBandwidth.
+    // P2P (1-to-1), so sharing=1 on every hop.
+    double CalculatePipelineHandoffCost(int64_t activation_bytes,
+                                        int devices_per_stage) const;
+
+    // Determine CommType from a Calcium path. Used by CSV export.
+    CommType DetermineCommTypeFromPath(const std::vector<PathComponent>& path) const;
+
+    // Diagnostic getters.
+    double GetIntranodeEfficiencyFactor() const { return intranode_efficiency_factor_; }
+    double GetInternodeEfficiencyFactor() const { return internode_efficiency_factor_; }
 };
 
 // Factory function to create cluster config based on device type

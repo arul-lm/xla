@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <unistd.h>
@@ -469,6 +471,13 @@ CommType GpuClusterConfig::DetermineCommTypeFromPath(
       case PathComponent::CoreSwitch:
         has_core = true;
         break;
+      // Calcium-only path components. GpuClusterConfig::PathBetweenDevices
+      // never emits these; the cases exist purely to silence -Wswitch.
+      case PathComponent::L1Switch:
+      case PathComponent::L2Switch:
+      case PathComponent::L3Switch:
+      case PathComponent::ToRSwitch:
+        break;
     }
   }
 
@@ -664,15 +673,17 @@ std::unique_ptr<ClusterConfig>
 CreateClusterConfig(const std::string &device_type) {
   if (device_type.find("tpu") != std::string::npos) {
     return std::make_unique<TpuClusterConfig>();
+  } else if (device_type.find("q250") != std::string::npos ||
+             device_type.find("calcium") != std::string::npos) {
+    // Calcium uses a dedicated 4-level fabric-routing config that
+    // explicitly models L1/L2/L3 PCIe + L4 Ethernet RoCE v2 with
+    // oversubscription and replica-group contention.
+    return std::make_unique<CalciumClusterConfig>();
   } else if (device_type.find("b200") != std::string::npos ||
              device_type.find("r200") != std::string::npos ||
              device_type.find("r576") != std::string::npos ||
              device_type.find("rcpx") != std::string::npos ||
-             device_type.find("b300") != std::string::npos ||
-             device_type.find("q250") != std::string::npos ||
-             device_type.find("calcium") != std::string::npos) {
-    // Step 7 will introduce CalciumClusterConfig with 4-level fabric routing.
-    // Until then q250 falls through to the 2-level GpuClusterConfig stopgap.
+             device_type.find("b300") != std::string::npos) {
     return std::make_unique<GpuClusterConfig>();
   } else {
     std::cerr << "ERROR: CreateClusterConfig - Unknown device type: "
@@ -695,6 +706,10 @@ std::unique_ptr<ClusterConfig> GetClusterConfigByName(
     if (device_name.find("tpu") != std::string::npos) {
       return std::make_unique<TpuClusterConfig>(
           *static_cast<TpuClusterConfig *>(it->second.get()));
+    } else if (device_name.find("q250") != std::string::npos ||
+               device_name.find("calcium") != std::string::npos) {
+      return std::make_unique<CalciumClusterConfig>(
+          *static_cast<CalciumClusterConfig *>(it->second.get()));
     } else {
       return std::make_unique<GpuClusterConfig>(
           *static_cast<GpuClusterConfig *>(it->second.get()));
@@ -721,6 +736,10 @@ std::unique_ptr<ClusterConfig> GetClusterConfigByName(
     if (device_name.find("tpu") != std::string::npos) {
       config_cache[device_name] = std::make_unique<TpuClusterConfig>(
           *static_cast<TpuClusterConfig *>(config.get()));
+    } else if (device_name.find("q250") != std::string::npos ||
+               device_name.find("calcium") != std::string::npos) {
+      config_cache[device_name] = std::make_unique<CalciumClusterConfig>(
+          *static_cast<CalciumClusterConfig *>(config.get()));
     } else {
       config_cache[device_name] = std::make_unique<GpuClusterConfig>(
           *static_cast<GpuClusterConfig *>(config.get()));
@@ -1138,3 +1157,386 @@ CommCostStats GpuClusterConfig::CalculateCommCost(
           max_hops,
           per_link_cost_us};
 }
+
+// ============================================================================
+// CalciumClusterConfig Implementation
+//
+// 4-level fabric: L1 (intra-pod, 8 SoCs) -> L2 (intra-card, 24 SoCs) ->
+//                 L3 (intra-server, 192 SoCs) -> L4 (inter-server, RoCE v2).
+// ============================================================================
+
+CalciumClusterConfig::CalciumClusterConfig()
+    : name_pattern_(""),
+      l1_pod_size_(8),
+      l1_link_bw_gbytes_(64.0),
+      l1_oversubscription_(1.0),
+      l1_pods_per_card_(3),
+      l2_link_bw_gbytes_(256.0),
+      l2_oversubscription_(2.0),
+      cards_per_server_(8),
+      l3_link_bw_gbytes_(512.0),
+      l3_oversubscription_(3.0),
+      host_nic_link_bw_gbytes_(800.0),
+      l4_per_card_egress_gbytes_(100.0),
+      tor_switch_uplink_gbytes_(800.0),
+      intranode_efficiency_factor_(0.95),
+      internode_efficiency_factor_(0.85),
+      device_id_layout_("row_major_socs_first") {}
+
+std::string CalciumClusterConfig::GetNamePattern() const { return name_pattern_; }
+
+bool CalciumClusterConfig::LoadFromFile(const std::string &config_file_path) {
+  std::ifstream file(config_file_path);
+  if (!file.is_open()) {
+    std::cerr
+        << "ERROR: CalciumClusterConfig::LoadFromFile - Cannot open file: "
+        << config_file_path << std::endl;
+    return false;
+  }
+
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    size_t eq_pos = line.find('=');
+    if (eq_pos == std::string::npos) continue;
+
+    std::string key = line.substr(0, eq_pos);
+    std::string value = line.substr(eq_pos + 1);
+    // Trim whitespace.
+    key.erase(0, key.find_first_not_of(" \t"));
+    key.erase(key.find_last_not_of(" \t") + 1);
+    value.erase(0, value.find_first_not_of(" \t"));
+    value.erase(value.find_last_not_of(" \t") + 1);
+
+    if (key == "name_pattern") {
+      name_pattern_ = value;
+    } else if (key == "device_id_layout") {
+      device_id_layout_ = value;
+    } else if (key == "l1_pod_size") {
+      l1_pod_size_ = std::stoi(value);
+    } else if (key == "l1_link_bw_gbytes") {
+      l1_link_bw_gbytes_ = std::stod(value);
+    } else if (key == "l1_oversubscription") {
+      l1_oversubscription_ = std::stod(value);
+    } else if (key == "l1_pods_per_card") {
+      l1_pods_per_card_ = std::stoi(value);
+    } else if (key == "l2_link_bw_gbytes") {
+      l2_link_bw_gbytes_ = std::stod(value);
+    } else if (key == "l2_oversubscription") {
+      l2_oversubscription_ = std::stod(value);
+    } else if (key == "cards_per_server") {
+      cards_per_server_ = std::stoi(value);
+    } else if (key == "l3_link_bw_gbytes") {
+      l3_link_bw_gbytes_ = std::stod(value);
+    } else if (key == "l3_oversubscription") {
+      l3_oversubscription_ = std::stod(value);
+    } else if (key == "host_nic_link_bw_gbytes") {
+      host_nic_link_bw_gbytes_ = std::stod(value);
+    } else if (key == "l4_per_card_egress_gbytes") {
+      l4_per_card_egress_gbytes_ = std::stod(value);
+    } else if (key == "tor_switch_uplink_gbytes") {
+      tor_switch_uplink_gbytes_ = std::stod(value);
+    } else if (key == "intranode_efficiency_factor") {
+      intranode_efficiency_factor_ = std::stod(value);
+    } else if (key == "internode_efficiency_factor") {
+      internode_efficiency_factor_ = std::stod(value);
+    }
+  }
+
+  file.close();
+
+  if (device_id_layout_ != "row_major_socs_first") {
+    std::cerr << "ERROR: CalciumClusterConfig::LoadFromFile - Unsupported "
+                 "device_id_layout: "
+              << device_id_layout_ << " (only row_major_socs_first supported)"
+              << std::endl;
+    return false;
+  }
+
+  return true;
+}
+
+CalciumCoord CalciumClusterConfig::DecodeId(int64_t id) const {
+  // Layout: id = server*192 + card*24 + l1_pod*8 + soc_in_pod
+  CalciumCoord c;
+  const int64_t socs_per_pod = l1_pod_size_;                          // 8
+  const int64_t pods_per_card = l1_pods_per_card_;                    // 3
+  const int64_t cards_per_srv = cards_per_server_;                    // 8
+
+  c.soc_in_pod = static_cast<int>(id % socs_per_pod);
+  id /= socs_per_pod;
+  c.l1_pod = static_cast<int>(id % pods_per_card);
+  id /= pods_per_card;
+  c.card = static_cast<int>(id % cards_per_srv);
+  id /= cards_per_srv;
+  c.server = static_cast<int>(id);
+  return c;
+}
+
+std::vector<PathComponent>
+CalciumClusterConfig::PathBetweenDevices(int64_t src, int64_t dst) const {
+  CalciumCoord s = DecodeId(src);
+  CalciumCoord d = DecodeId(dst);
+
+  // Same SoC.
+  if (s.server == d.server && s.card == d.card &&
+      s.l1_pod == d.l1_pod && s.soc_in_pod == d.soc_in_pod) {
+    return {PathComponent::GPU};
+  }
+  // Intra-pod: 2 hops.
+  if (s.server == d.server && s.card == d.card && s.l1_pod == d.l1_pod) {
+    return {PathComponent::GPU, PathComponent::L1Switch, PathComponent::GPU};
+  }
+  // Intra-card, cross-pod: 4 hops.
+  if (s.server == d.server && s.card == d.card) {
+    return {PathComponent::GPU, PathComponent::L1Switch,
+            PathComponent::L2Switch, PathComponent::L1Switch,
+            PathComponent::GPU};
+  }
+  // Intra-server, cross-card: 6 hops.
+  if (s.server == d.server) {
+    return {PathComponent::GPU, PathComponent::L1Switch,
+            PathComponent::L2Switch, PathComponent::L3Switch,
+            PathComponent::L2Switch, PathComponent::L1Switch,
+            PathComponent::GPU};
+  }
+  // Inter-server: 10 hops via ToR.
+  return {PathComponent::GPU,      PathComponent::L1Switch,
+          PathComponent::L2Switch, PathComponent::L3Switch,
+          PathComponent::NIC,      PathComponent::ToRSwitch,
+          PathComponent::NIC,      PathComponent::L3Switch,
+          PathComponent::L2Switch, PathComponent::L1Switch,
+          PathComponent::GPU};
+}
+
+namespace {
+// Local helper: order-insensitive link match.
+bool IsLink(PathComponent a, PathComponent b, PathComponent x, PathComponent y) {
+  return (a == x && b == y) || (a == y && b == x);
+}
+}  // namespace
+
+double CalciumClusterConfig::StaticLinkBandwidth(PathComponent a,
+                                                 PathComponent b) const {
+  if (IsLink(a, b, PathComponent::GPU, PathComponent::L1Switch))
+    return l1_link_bw_gbytes_;
+  if (IsLink(a, b, PathComponent::L1Switch, PathComponent::L2Switch))
+    return l2_link_bw_gbytes_;
+  if (IsLink(a, b, PathComponent::L2Switch, PathComponent::L3Switch))
+    return l3_link_bw_gbytes_;
+  if (IsLink(a, b, PathComponent::L3Switch, PathComponent::NIC))
+    return host_nic_link_bw_gbytes_;
+  if (IsLink(a, b, PathComponent::NIC, PathComponent::ToRSwitch))
+    return tor_switch_uplink_gbytes_;
+  // Defensive fallback for unexpected adjacent pairs in well-formed Calcium
+  // paths. Returning 1.0 makes path_cost = volume_gb / 1.0 -> seconds, which
+  // is large enough to surface clearly as a bug if ever hit.
+  return 1.0;
+}
+
+double CalciumClusterConfig::StaticOversubscription(PathComponent a,
+                                                    PathComponent b) const {
+  if (IsLink(a, b, PathComponent::L1Switch, PathComponent::L2Switch))
+    return l2_oversubscription_;
+  if (IsLink(a, b, PathComponent::L2Switch, PathComponent::L3Switch))
+    return l3_oversubscription_;
+  // L1 (non-blocking), host-internal, L4 ToR uplinks: no internal oversub.
+  return 1.0;
+}
+
+double CalciumClusterConfig::EffectiveBandwidth(PathComponent a,
+                                                PathComponent b,
+                                                int devices_sharing) const {
+  if (devices_sharing < 1) devices_sharing = 1;
+  return StaticLinkBandwidth(a, b) /
+         (StaticOversubscription(a, b) * static_cast<double>(devices_sharing));
+}
+
+int CalciumClusterConfig::ComputeDevicesSharingHop(
+    PathComponent a, PathComponent b,
+    const std::vector<int64_t> &device_ids) const {
+  // GPU<->L1Switch: dedicated link, never shared.
+  if (IsLink(a, b, PathComponent::GPU, PathComponent::L1Switch)) return 1;
+
+  auto MaxGroupSize = [&](auto key_fn) -> int {
+    std::unordered_map<int64_t, int> counts;
+    for (int64_t id : device_ids) {
+      counts[key_fn(DecodeId(id))]++;
+    }
+    int max_n = 0;
+    for (const auto &kv : counts) {
+      if (kv.second > max_n) max_n = kv.second;
+    }
+    return std::max(1, max_n);
+  };
+
+  // L1<->L2: per-pod L2 uplink, shared by all 8 SoCs in the pod that
+  // participate in this collective.
+  if (IsLink(a, b, PathComponent::L1Switch, PathComponent::L2Switch)) {
+    return MaxGroupSize([this](CalciumCoord c) -> int64_t {
+      return (static_cast<int64_t>(c.server) * cards_per_server_ + c.card) *
+                 l1_pods_per_card_ +
+             c.l1_pod;
+    });
+  }
+  // L2<->L3: per-card L3 uplink, shared by all 24 SoCs on the card that
+  // participate in this collective.
+  if (IsLink(a, b, PathComponent::L2Switch, PathComponent::L3Switch)) {
+    return MaxGroupSize([this](CalciumCoord c) -> int64_t {
+      return static_cast<int64_t>(c.server) * cards_per_server_ + c.card;
+    });
+  }
+  // L3<->NIC and NIC<->ToR: per-server egress, shared by all 192 SoCs on the
+  // server that participate in this collective.
+  if (IsLink(a, b, PathComponent::L3Switch, PathComponent::NIC) ||
+      IsLink(a, b, PathComponent::NIC, PathComponent::ToRSwitch)) {
+    return MaxGroupSize(
+        [](CalciumCoord c) -> int64_t { return c.server; });
+  }
+  return 1;
+}
+
+double CalciumClusterConfig::CalculatePipelineHandoffCost(
+    int64_t activation_bytes, int devices_per_stage) const {
+  if (devices_per_stage <= 0 || activation_bytes <= 0) return 0.0;
+
+  const int64_t src = 0;
+  const int64_t dst = devices_per_stage;
+  std::vector<PathComponent> path = PathBetweenDevices(src, dst);
+  if (path.size() < 2) return 0.0;
+
+  // P2P (1-to-1) handoff: sharing=1 on every hop.
+  double bottleneck_gbps = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i + 1 < path.size(); ++i) {
+    double bw = EffectiveBandwidth(path[i], path[i + 1], /*sharing=*/1);
+    if (bw < bottleneck_gbps) bottleneck_gbps = bw;
+  }
+  if (!std::isfinite(bottleneck_gbps) || bottleneck_gbps <= 0.0) return 0.0;
+
+  const double effective_bw = bottleneck_gbps * internode_efficiency_factor_;
+  // bytes -> GB -> seconds -> microseconds.
+  return (static_cast<double>(activation_bytes) / 1e9) / effective_bw * 1e6;
+}
+
+CommType CalciumClusterConfig::DetermineCommTypeFromPath(
+    const std::vector<PathComponent> &path) const {
+  bool has_tor = false;
+  bool has_l3 = false;
+  for (PathComponent c : path) {
+    if (c == PathComponent::ToRSwitch) has_tor = true;
+    if (c == PathComponent::L3Switch) has_l3 = true;
+  }
+  // Cross-server (L4 via ToR) is scale-out; everything else is scale-up
+  // because the entire 192-SoC server is treated as a single scale-up domain.
+  if (has_tor) return CommType::ScaleOut;
+  // Differentiate intra-server cross-card (uses L3) from intra-card.
+  // Both fall under ScaleUp for the existing CommType vocabulary.
+  (void)has_l3;
+  return CommType::ScaleUp;
+}
+
+CommCostStats CalciumClusterConfig::CalculateCommCost(
+    double per_device_comm_volume,
+    const stream_executor::DeviceDescription & /*device_info*/,
+    const xla::HloInstruction * /*instr*/, uint64_t replica_group_size,
+    uint64_t /*num_replica_groups*/, const std::vector<int64_t> &device_ids,
+    const std::vector<int> & /*mesh_shape*/,
+    const std::string & /*hardware_architecture*/,
+    const std::string & /*fallback_device_type*/) {
+  if (per_device_comm_volume < 0.0) {
+    CHECK_GE(per_device_comm_volume, 0.0)
+        << "per_device_comm_volume must be >= 0, got: "
+        << per_device_comm_volume;
+  }
+  if (device_ids.empty()) {
+    LOG(FATAL) << "CalciumClusterConfig::CalculateCommCost - device_ids "
+                  "cannot be empty";
+  }
+
+  const double per_device_comm_vol_gb =
+      per_device_comm_volume / (1024.0 * 1024.0 * 1024.0);
+
+  // Find the worst-case pair in the replica group: largest hop count, and
+  // among those, smallest effective bandwidth on the bottleneck hop.
+  double max_comm_cost_us = 0.0;
+  int max_hops = 0;
+  CommType comm_type = CommType::ScaleUp;
+  std::vector<PathComponent> longest_path;
+  double longest_bottleneck_gbps = 0.0;
+
+  for (size_t i = 0; i < device_ids.size(); ++i) {
+    const int64_t src = device_ids[i];
+    const int64_t dst = device_ids[(i + 1) % device_ids.size()];
+    std::vector<PathComponent> path = PathBetweenDevices(src, dst);
+    if (path.size() < 2) continue;
+
+    // Per-hop effective bandwidth with replica-group contention.
+    double bottleneck_gbps = std::numeric_limits<double>::infinity();
+    for (size_t h = 0; h + 1 < path.size(); ++h) {
+      const int sharing =
+          ComputeDevicesSharingHop(path[h], path[h + 1], device_ids);
+      const double bw = EffectiveBandwidth(path[h], path[h + 1], sharing);
+      if (bw < bottleneck_gbps) bottleneck_gbps = bw;
+    }
+    if (!std::isfinite(bottleneck_gbps) || bottleneck_gbps <= 0.0) continue;
+
+    const int hop_count = static_cast<int>(path.size() - 1);
+    // hop latency 1us per hop, matching GpuClusterConfig.
+    const double hop_latency_us = 1.0;
+    const double path_cost_us =
+        (per_device_comm_vol_gb / bottleneck_gbps) * 1e6 +
+        hop_count * hop_latency_us;
+
+    if (path_cost_us > max_comm_cost_us) {
+      max_comm_cost_us = path_cost_us;
+      max_hops = hop_count;
+      longest_path = path;
+      longest_bottleneck_gbps = bottleneck_gbps;
+    }
+  }
+
+  if (!longest_path.empty()) {
+    comm_type = DetermineCommTypeFromPath(longest_path);
+  }
+
+  // Apply efficiency factor based on intra/inter-node classification.
+  // Note: per_device_comm_volume already incorporates the 2*(N-1)/N collective
+  // factor from the caller; we must NOT re-apply it here.
+  const double efficiency = (comm_type == CommType::ScaleOut)
+                                ? internode_efficiency_factor_
+                                : intranode_efficiency_factor_;
+  if (efficiency > 0.0 && efficiency < 1.0 && max_comm_cost_us > 0.0) {
+    max_comm_cost_us /= efficiency;
+  }
+  (void)replica_group_size;  // Reserved for future use (e.g., per-protocol tuning).
+
+  double intranode_comm_vol_gb = 0.0;
+  double internode_comm_vol_gb = 0.0;
+  if (comm_type == CommType::ScaleOut) {
+    internode_comm_vol_gb = per_device_comm_vol_gb;
+  } else {
+    intranode_comm_vol_gb = per_device_comm_vol_gb;
+  }
+  const double total_comm_vol_gb =
+      intranode_comm_vol_gb + internode_comm_vol_gb;
+
+  const double avg_bandwidth_gbps =
+      (max_comm_cost_us > 0.0)
+          ? per_device_comm_vol_gb / (max_comm_cost_us / 1e6)
+          : 0.0;
+  const double per_link_cost_us =
+      (max_hops > 0) ? max_comm_cost_us / max_hops : 0.0;
+  (void)longest_bottleneck_gbps;  // available for future diagnostics
+
+  return {comm_type,
+          max_comm_cost_us,
+          intranode_comm_vol_gb,
+          internode_comm_vol_gb,
+          avg_bandwidth_gbps,  // intranode_comm_bw_gbps
+          avg_bandwidth_gbps,  // internode_comm_bw_gbps
+          total_comm_vol_gb,
+          per_device_comm_vol_gb,
+          max_hops,
+          per_link_cost_us};
+}
+

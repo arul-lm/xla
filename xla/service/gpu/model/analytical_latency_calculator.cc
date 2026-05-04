@@ -38,7 +38,18 @@ int main(int argc, char *argv[]) {
                 "10 to verify memory-bound: if total time drops a lot, workload "
                 "is memory-bound."),
       tsl::Flag("dump-modified-module", &opts.dump_modified_module,
-                "Dump modified HLO module to file")};
+                "Dump modified HLO module to file"),
+      // Pipeline-parallelism flags (Calcium-only). Defaults preserve legacy
+      // behavior: num-pipeline-stages=1 disables PP modeling.
+      tsl::Flag("num-pipeline-stages", &opts.num_pipeline_stages,
+                "Number of pipeline stages (Calcium-only). Default 1 = no "
+                "PP modeling. Values > 1 are rejected for non-Calcium archs."),
+      tsl::Flag("pipeline-activation-bytes", &opts.pipeline_activation_bytes,
+                "Per-stage activation bytes for inter-stage handoff. 0 = "
+                "auto-infer from HLO entry-computation parameter shapes."),
+      tsl::Flag("pipeline-microbatches", &opts.pipeline_microbatches,
+                "Number of microbatches in the pipeline step. 0 reports "
+                "per-microbatch metrics only.")};
   xla::AppendDebugOptionsFlags(&flag_list);
   std::string usage_string = tsl::Flags::Usage(argv[0], flag_list);
   if (!tsl::Flags::Parse(&argc, argv, flag_list)) {

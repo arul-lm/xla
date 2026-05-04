@@ -39,6 +39,8 @@
 #include "xla/util.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/MLIRContext.h"
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -71,6 +73,91 @@ struct OverlapStats {
   double overlap_factor;
   std::vector<InstructionTimelineEntry> timeline;
 };
+
+// Pipeline-parallelism summary metrics for a single Calcium architecture.
+struct PipelineMetrics {
+  int    num_pipeline_stages;
+  int64_t pipeline_activation_bytes;
+  int    pipeline_microbatches;
+  int    devices_per_stage;
+  double t_stage_us;          // per-stage compute+comm latency (one microbatch)
+  double t_handoff_us;         // inter-stage activation handoff latency
+  double t_first_us;           // pipeline fill latency
+  double t_step_us;            // steady-state per-microbatch latency
+  double t_total_us;           // total runtime for M microbatches (0 if M==0)
+  double bubble_time_us;       // pipeline-fill bubble time
+  double bubble_fraction;      // bubble_time_us / t_total_us
+  std::string bound_by;        // "compute" | "comm" | "balanced"
+};
+
+// Sum the byte sizes of all entry-computation parameter shapes. Used as the
+// default pipeline activation size when the caller passes 0 in
+// AnalyticalLatencyCalculatorOpts::pipeline_activation_bytes.
+int64_t InferActivationBytes(const xla::HloModule& hlo_module) {
+  int64_t total = 0;
+  const xla::HloComputation* entry = hlo_module.entry_computation();
+  if (entry == nullptr) return 0;
+  for (const xla::HloInstruction* param : entry->parameter_instructions()) {
+    total += xla::ShapeUtil::ByteSizeOf(param->shape());
+  }
+  return total;
+}
+
+// Compute pipeline-parallelism metrics from per-microbatch latencies and
+// pipeline configuration. Forward-only inference schedule:
+//   T_first    = num_stages * T_stage + (num_stages - 1) * T_handoff
+//   T_step     = max(T_stage, T_handoff)
+//   T_total(M) = T_first + (M - 1) * T_step  for M >= 1, else 0
+//   bubble_time = (num_stages - 1) * T_stage + (num_stages - 1) * T_handoff
+//                 (time spent during pipeline fill before steady-state)
+PipelineMetrics ComputePipelineMetrics(
+    int num_pipeline_stages, int64_t pipeline_activation_bytes,
+    int pipeline_microbatches, int devices_per_stage,
+    double t_stage_us, double t_handoff_us) {
+  PipelineMetrics m;
+  m.num_pipeline_stages = num_pipeline_stages;
+  m.pipeline_activation_bytes = pipeline_activation_bytes;
+  m.pipeline_microbatches = pipeline_microbatches;
+  m.devices_per_stage = devices_per_stage;
+  m.t_stage_us = t_stage_us;
+  m.t_handoff_us = t_handoff_us;
+
+  const int S = std::max(1, num_pipeline_stages);
+  m.t_first_us = static_cast<double>(S) * t_stage_us +
+                 static_cast<double>(S - 1) * t_handoff_us;
+  m.t_step_us = std::max(t_stage_us, t_handoff_us);
+
+  if (pipeline_microbatches > 0) {
+    m.t_total_us = m.t_first_us +
+                   (static_cast<double>(pipeline_microbatches) - 1.0) *
+                       m.t_step_us;
+  } else {
+    m.t_total_us = 0.0;
+  }
+
+  m.bubble_time_us = static_cast<double>(S - 1) * t_stage_us +
+                     static_cast<double>(S - 1) * t_handoff_us;
+  m.bubble_fraction = (m.t_total_us > 0.0)
+                          ? (m.bubble_time_us / m.t_total_us)
+                          : 0.0;
+
+  // bound_by classification: 10% threshold for "balanced".
+  if (t_stage_us <= 0.0 && t_handoff_us <= 0.0) {
+    m.bound_by = "balanced";
+  } else {
+    const double max_v = std::max(t_stage_us, t_handoff_us);
+    const double min_v = std::min(t_stage_us, t_handoff_us);
+    const double ratio = (max_v > 0.0) ? (min_v / max_v) : 1.0;
+    if (ratio >= 0.9) {
+      m.bound_by = "balanced";
+    } else if (t_stage_us > t_handoff_us) {
+      m.bound_by = "compute";
+    } else {
+      m.bound_by = "comm";
+    }
+  }
+  return m;
+}
 
 // Helper function to get device IDs from one replica group after symmetry check
 std::vector<int64_t>
@@ -825,6 +912,24 @@ absl::Status RunAnalyticalLatencyCalculation(
     return validation_status;
   }
 
+  // Pipeline parallelism is Calcium-only. Reject up front when PP > 1 is
+  // requested with any non-Calcium architecture; other archs assume PP=1.
+  if (opts.num_pipeline_stages > 1) {
+    for (const std::string& arch : opts.hardware_architectures) {
+      std::string lower(arch);
+      std::transform(lower.begin(), lower.end(), lower.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (lower.find("q250") == std::string::npos &&
+          lower.find("calcium") == std::string::npos) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Pipeline parallelism (num_pipeline_stages=",
+            opts.num_pipeline_stages,
+            ") is only supported for q250/calcium. Got: ", arch,
+            ". Other architectures assume PP=1; pass num_pipeline_stages=1."));
+      }
+    }
+  }
+
   llvm::outs() << "Using hardware architectures: ";
   for (size_t i = 0; i < opts.hardware_architectures.size(); ++i) {
     if (i > 0)
@@ -873,7 +978,8 @@ absl::Status RunAnalyticalLatencyCalculation(
   }
 
   std::vector<std::vector<std::string>> device_stats_data, comp_stats_data,
-      comm_stats_data, overlap_stats_data, instruction_timeline_data;
+      comm_stats_data, overlap_stats_data, instruction_timeline_data,
+      pipeline_stats_data;
   std::vector<std::string> device_stats_header = {
       "device_name",           "overlapped_latency_secs",
       "original_latency_secs", "compute_time_secs",
@@ -933,6 +1039,24 @@ absl::Status RunAnalyticalLatencyCalculation(
   comm_stats_data.push_back(comm_stats_header);
   overlap_stats_data.push_back(overlap_stats_header);
   instruction_timeline_data.push_back(instruction_timeline_header);
+
+  // Pipeline-parallelism stats (Calcium-only). Header is appended only if a
+  // PP run actually produces rows; the file is written only in that case.
+  std::vector<std::string> pipeline_stats_header = {
+      "device_name",
+      "hw_arch",
+      "num_pipeline_stages",
+      "pipeline_microbatches",
+      "pipeline_activation_bytes",
+      "devices_per_stage",
+      "t_stage_us",
+      "t_handoff_us",
+      "t_first_us",
+      "t_step_us",
+      "t_total_us",
+      "bubble_time_us",
+      "bubble_fraction",
+      "bound_by"};
 
   // Infer module format from file extension. .mlir is treated as HLO text (the
   // file content is a HLO variant, not MLIR/MHLO). Other extensions map to
@@ -1595,6 +1719,72 @@ absl::Status RunAnalyticalLatencyCalculation(
         std::to_string(instruction_timeline.size())};
     overlap_stats_data.push_back(overlap_row);
 
+    // Pipeline-parallelism modeling (Calcium-only).
+    // The FFI layer rejects PP > 1 for non-Calcium archs; here we still guard
+    // with a dynamic_cast to avoid corrupting CSV output if some future caller
+    // bypasses validation.
+    if (opts.num_pipeline_stages > 1) {
+      CalciumClusterConfig* calcium =
+          dynamic_cast<CalciumClusterConfig*>(cluster_config.get());
+      if (calcium != nullptr) {
+        const int64_t activation_bytes =
+            (opts.pipeline_activation_bytes > 0)
+                ? opts.pipeline_activation_bytes
+                : InferActivationBytes(*hlo_module);
+        // devices_per_stage = product(mesh_shape) per the agreed convention.
+        int devices_per_stage = 1;
+        for (int d : mesh_shape) {
+          if (d > 0) devices_per_stage *= d;
+        }
+
+        const double t_stage_us = overlap_stats.original_total_time_us;
+        const double t_handoff_us = calcium->CalculatePipelineHandoffCost(
+            activation_bytes, devices_per_stage);
+
+        PipelineMetrics pm = ComputePipelineMetrics(
+            opts.num_pipeline_stages, activation_bytes,
+            opts.pipeline_microbatches, devices_per_stage, t_stage_us,
+            t_handoff_us);
+
+        pipeline_stats_data.push_back({
+            device_name,
+            spec_file_name,
+            std::to_string(pm.num_pipeline_stages),
+            std::to_string(pm.pipeline_microbatches),
+            std::to_string(pm.pipeline_activation_bytes),
+            std::to_string(pm.devices_per_stage),
+            std::to_string(pm.t_stage_us),
+            std::to_string(pm.t_handoff_us),
+            std::to_string(pm.t_first_us),
+            std::to_string(pm.t_step_us),
+            std::to_string(pm.t_total_us),
+            std::to_string(pm.bubble_time_us),
+            std::to_string(pm.bubble_fraction),
+            pm.bound_by,
+        });
+
+        llvm::outs() << "=== Pipeline Parallelism (Calcium) ===\n";
+        llvm::outs() << "  num_pipeline_stages: " << pm.num_pipeline_stages
+                     << "\n";
+        llvm::outs() << "  pipeline_microbatches: "
+                     << pm.pipeline_microbatches << "\n";
+        llvm::outs() << "  pipeline_activation_bytes: "
+                     << pm.pipeline_activation_bytes << "\n";
+        llvm::outs() << "  devices_per_stage: " << pm.devices_per_stage
+                     << "\n";
+        llvm::outs() << "  t_stage_us:   " << pm.t_stage_us << "\n";
+        llvm::outs() << "  t_handoff_us: " << pm.t_handoff_us << "\n";
+        llvm::outs() << "  t_first_us:   " << pm.t_first_us << "\n";
+        llvm::outs() << "  t_step_us:    " << pm.t_step_us << "\n";
+        llvm::outs() << "  t_total_us:   " << pm.t_total_us << "\n";
+        llvm::outs() << "  bubble_time_us:  " << pm.bubble_time_us << "\n";
+        llvm::outs() << "  bubble_fraction: " << pm.bubble_fraction << "\n";
+        llvm::outs() << "  bound_by:        " << pm.bound_by << "\n";
+        llvm::outs() << "======================================\n";
+        llvm::outs().flush();
+      }
+    }
+
     // Add instruction timeline to CSV data
     for (const auto &entry : overlap_stats.timeline) {
       std::string instruction_type = "other";
@@ -1708,6 +1898,31 @@ absl::Status RunAnalyticalLatencyCalculation(
   comm_stats_csv.stream.close();
   overlap_stats_csv.stream.close();
   instruction_timeline_csv.stream.close();
+
+  // Pipeline stats: write only if at least one Calcium arch produced rows
+  // (PP > 1 was requested AND the cluster config is CalciumClusterConfig).
+  // This keeps the existing CSV outputs byte-identical for non-PP runs.
+  std::string pipeline_stats_csv_path;
+  if (!pipeline_stats_data.empty()) {
+    pipeline_stats_csv_path =
+        tsl::io::JoinPath(output_path, "pipeline_stats.csv");
+    CsvOut pipeline_stats_csv = createCsv(pipeline_stats_csv_path, true);
+    if (pipeline_stats_csv.stream.is_open()) {
+      // Prepend header.
+      std::vector<std::vector<std::string>> with_header;
+      with_header.reserve(pipeline_stats_data.size() + 1);
+      with_header.push_back(pipeline_stats_header);
+      for (auto& row : pipeline_stats_data) with_header.push_back(row);
+      writeCsv(pipeline_stats_csv.stream, with_header,
+               pipeline_stats_csv.write_header);
+      pipeline_stats_csv.stream.close();
+    } else {
+      llvm::errs() << "Warning: failed to open pipeline_stats.csv for "
+                      "writing; pipeline metrics dropped.\n";
+      pipeline_stats_csv_path.clear();
+    }
+  }
+
   llvm::outs() << "CSV files saved to: "
                << tsl::io::JoinPath(output_path, "device_stats.csv") << ", "
                << tsl::io::JoinPath(output_path, "comp_stats.csv") << ", "
@@ -1717,8 +1932,11 @@ absl::Status RunAnalyticalLatencyCalculation(
                << ", "
                << tsl::io::JoinPath(output_path, "compute_op_counts.csv")
                << ", "
-               << tsl::io::JoinPath(output_path, "compute_memory_bound_stats.csv")
-               << "\n";
+               << tsl::io::JoinPath(output_path, "compute_memory_bound_stats.csv");
+  if (!pipeline_stats_csv_path.empty()) {
+    llvm::outs() << ", " << pipeline_stats_csv_path;
+  }
+  llvm::outs() << "\n";
   llvm::outs() << "Done\n";
   return absl::OkStatus();
 }

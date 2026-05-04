@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_MODEL_ANALYTICAL_LATENCY_CALCULATOR_CORE_H_
 #define XLA_SERVICE_GPU_MODEL_ANALYTICAL_LATENCY_CALCULATOR_CORE_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,13 @@ struct AnalyticalLatencyCalculatorOpts {
    * drops a lot, the workload is memory-bound.
    */
   double scale_memory_bandwidth = 1.0;
+
+  // Pipeline parallelism (Calcium-only). When num_pipeline_stages <= 1 (the
+  // default), all PP code paths are dead and outputs are byte-identical to
+  // pre-PP behavior for every architecture.
+  int     num_pipeline_stages = 1;          // 1 = no PP modeling
+  int64_t pipeline_activation_bytes = 0;    // 0 = auto-infer from HLO
+  int     pipeline_microbatches = 0;        // 0 = per-microbatch only
 };
 
 // Runs the analytical latency calculation: loads the HLO module, runs

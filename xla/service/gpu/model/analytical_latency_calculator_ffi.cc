@@ -15,10 +15,14 @@ limitations under the License.
 
 #include "xla/service/gpu/model/analytical_latency_calculator_c.h"
 
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/strip.h"
 #include "xla/service/gpu/model/analytical_latency_calculator_core.h"
@@ -35,11 +39,18 @@ void CopyErrorMessage(const std::string& message, char* error_buffer,
   error_buffer[to_copy] = '\0';
 }
 
+// Returns true if `arch` (case-insensitive) is q250 / Calcium.
+bool IsCalciumArch(const std::string& arch) {
+  std::string lower = absl::AsciiStrToLower(arch);
+  return absl::StrContains(lower, "q250") ||
+         absl::StrContains(lower, "calcium");
+}
+
 }  // namespace
 
 extern "C" {
 
-int analytical_latency_calculator_run(
+int analytical_latency_calculator_run_with_pipeline(
     const char* hlo_module_file,
     const char* hardware_architectures,
     const char* output_dir,
@@ -49,6 +60,9 @@ int analytical_latency_calculator_run(
     int fix_ragged_dot_flops,
     int dump_modified_module,
     double scale_memory_bandwidth,
+    int num_pipeline_stages,
+    int64_t pipeline_activation_bytes,
+    int pipeline_microbatches,
     char* error_buffer,
     size_t error_buffer_size) {
   if (hlo_module_file == nullptr || std::strlen(hlo_module_file) == 0) {
@@ -87,6 +101,14 @@ int analytical_latency_calculator_run(
   opts.fix_ragged_dot_flops = (fix_ragged_dot_flops != 0);
   opts.dump_modified_module = (dump_modified_module != 0);
   opts.scale_memory_bandwidth = scale_memory_bandwidth;
+
+  // Pipeline parallelism fields. Treat 0 as "no PP" (same as 1).
+  opts.num_pipeline_stages = (num_pipeline_stages > 0) ? num_pipeline_stages : 1;
+  opts.pipeline_activation_bytes =
+      (pipeline_activation_bytes > 0) ? pipeline_activation_bytes : 0;
+  opts.pipeline_microbatches =
+      (pipeline_microbatches > 0) ? pipeline_microbatches : 0;
+
   std::string output_prefix_str;  // empty: output_dir is absolute or relative to cwd
 
   if (hardware_architectures != nullptr &&
@@ -104,6 +126,24 @@ int analytical_latency_calculator_run(
     CopyErrorMessage("At least one hardware architecture is required",
                      error_buffer, error_buffer_size);
     return 1;
+  }
+
+  // Pipeline parallelism is currently a Calcium-only feature. Reject up front
+  // if the caller asked for PP > 1 with any non-Calcium architecture, since
+  // those archs assume PP=1 (the HLO represents the whole workload).
+  if (opts.num_pipeline_stages > 1) {
+    for (const std::string& arch : opts.hardware_architectures) {
+      if (!IsCalciumArch(arch)) {
+        std::string msg = absl::StrCat(
+            "Pipeline parallelism (num_pipeline_stages=",
+            opts.num_pipeline_stages,
+            ") is only supported for q250/calcium. Got: ", arch,
+            ". Other architectures assume PP=1; pass num_pipeline_stages=1 "
+            "(or use the legacy analytical_latency_calculator_run()).");
+        CopyErrorMessage(msg, error_buffer, error_buffer_size);
+        return 1;
+      }
+    }
   }
 
   std::vector<int> mesh_vec;
@@ -147,6 +187,33 @@ int analytical_latency_calculator_run(
     return 1;
   }
   return 0;
+}
+
+// Legacy entry point. Kept signature-stable for ABI compatibility with
+// pre-built downstream binaries that link against this symbol. Implemented
+// as a thin forwarder to analytical_latency_calculator_run_with_pipeline
+// with all PP fields set to defaults (no pipeline modeling, byte-identical
+// CSV outputs to the pre-Step-8 behavior).
+int analytical_latency_calculator_run(
+    const char* hlo_module_file,
+    const char* hardware_architectures,
+    const char* output_dir,
+    const char* gpu_model_data_root,
+    const char* mesh_shape,
+    double overlap_factor,
+    int fix_ragged_dot_flops,
+    int dump_modified_module,
+    double scale_memory_bandwidth,
+    char* error_buffer,
+    size_t error_buffer_size) {
+  return analytical_latency_calculator_run_with_pipeline(
+      hlo_module_file, hardware_architectures, output_dir,
+      gpu_model_data_root, mesh_shape, overlap_factor,
+      fix_ragged_dot_flops, dump_modified_module, scale_memory_bandwidth,
+      /*num_pipeline_stages=*/1,
+      /*pipeline_activation_bytes=*/0,
+      /*pipeline_microbatches=*/0,
+      error_buffer, error_buffer_size);
 }
 
 }  // extern "C"

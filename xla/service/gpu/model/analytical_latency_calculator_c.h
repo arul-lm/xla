@@ -78,6 +78,61 @@ int analytical_latency_calculator_run(
     char* error_buffer,
     size_t error_buffer_size);
 
+#include <stdint.h>
+
+/* Same as analytical_latency_calculator_run but with pipeline-parallelism
+   modeling for the Calcium (q250) architecture only. The HLO module is
+   interpreted as one pipeline stage; the calculator multiplies by the stage
+   count and accounts for inter-stage activation handoff cost.
+
+   PIPELINE PARAMETERS
+   -------------------
+   num_pipeline_stages: number of pipeline stages. Use 1 (or 0, treated as 1)
+       to disable PP modeling; outputs are then byte-identical to
+       analytical_latency_calculator_run().
+   pipeline_activation_bytes: byte size of the activation handed off between
+       consecutive stages. 0 = auto-infer from the HLO entry-computation
+       parameter shapes. For training (forward + backward), pass
+       2 * forward_size explicitly.
+   pipeline_microbatches: number of microbatches per pipeline step. 0 means
+       only per-microbatch steady-state metrics are reported (T_total_us is
+       left at 0 in pipeline_stats.csv).
+
+   ARCH RESTRICTION
+   ----------------
+   Pipeline parallelism modeling is currently only supported for q250/calcium.
+   Passing num_pipeline_stages > 1 with any other architecture (tpu, b200,
+   b300, r200, r576, rcpx) returns non-zero with an explicit error message in
+   error_buffer. Other architectures assume PP=1: pass num_pipeline_stages=1
+   (or use the legacy analytical_latency_calculator_run()) for those.
+
+   ABI STABILITY
+   -------------
+   This function is added alongside the existing analytical_latency_calculator_run
+   without altering its signature. Pre-built downstream binaries that link
+   against analytical_latency_calculator_run continue to work unchanged.
+
+   When num_pipeline_stages <= 1, this function delegates to the same
+   underlying core logic as analytical_latency_calculator_run() - the legacy
+   CSV outputs are byte-identical. When num_pipeline_stages > 1, an additional
+   pipeline_stats.csv is written under output_dir for each Calcium arch
+   processed. */
+int analytical_latency_calculator_run_with_pipeline(
+    const char* hlo_module_file,
+    const char* hardware_architectures,
+    const char* output_dir,
+    const char* gpu_model_data_root,
+    const char* mesh_shape,
+    double overlap_factor,
+    int fix_ragged_dot_flops,
+    int dump_modified_module,
+    double scale_memory_bandwidth,
+    int num_pipeline_stages,
+    int64_t pipeline_activation_bytes,
+    int pipeline_microbatches,
+    char* error_buffer,
+    size_t error_buffer_size);
+
 #ifdef __cplusplus
 }
 #endif

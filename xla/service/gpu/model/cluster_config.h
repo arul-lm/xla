@@ -331,13 +331,17 @@ public:
     // Used for --dump_path_trace parity check vs. the rack-level trace.
     double StaticLinkBandwidth(PathComponent a, PathComponent b) const;
 
-    // Static topological oversubscription factor for a hop.
+    // Static topological oversubscription factor for a hop. Informational /
+    // diagnostic: a structural ratio of (downstream-leaf demand) / (upstream
+    // link capacity). NOT used directly by EffectiveBandwidth - that quantity
+    // is fully determined by (link_bw, devices_sharing).
     double StaticOversubscription(PathComponent a, PathComponent b) const;
 
-    // Effective per-SoC bandwidth on a hop after both topological
-    // oversubscription and dynamic replica-group sharing. devices_sharing
-    // is the count of SoCs in the replica group that traverse the same
-    // switch uplink at this hop.
+    // Effective per-SoC bandwidth on a hop, accounting for replica-group
+    // sharing on the upstream link AND the per-SoC leaf-link cap (each SoC's
+    // own dedicated egress is at most l1_link_bw_gbytes_). devices_sharing is
+    // the count of SoCs in the replica group that traverse the same switch
+    // uplink at this hop. Returns min(leaf_bw, link_bw / devices_sharing).
     double EffectiveBandwidth(PathComponent a, PathComponent b,
                               int devices_sharing) const;
 

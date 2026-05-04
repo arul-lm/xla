@@ -1348,8 +1348,17 @@ double CalciumClusterConfig::EffectiveBandwidth(PathComponent a,
                                                 PathComponent b,
                                                 int devices_sharing) const {
   if (devices_sharing < 1) devices_sharing = 1;
-  return StaticLinkBandwidth(a, b) /
-         (StaticOversubscription(a, b) * static_cast<double>(devices_sharing));
+  // Per-SoC effective bandwidth at this hop is min(leaf-link capacity,
+  // shared upstream / devices sharing). The structural oversubscription
+  // recorded in the .config (StaticOversubscription) is already implied by
+  // (link_bw, sharing) at full-subtree saturation - dividing by it here would
+  // double-count. The leaf-link cap (l1_link_bw_gbytes_) prevents single-SoC
+  // and small replica groups from being credited with more upstream BW than
+  // the SoC's own dedicated egress port can sustain.
+  const double link_bw = StaticLinkBandwidth(a, b);
+  const double leaf_bw = l1_link_bw_gbytes_;
+  const double per_soc_share = link_bw / static_cast<double>(devices_sharing);
+  return std::min(leaf_bw, per_soc_share);
 }
 
 int CalciumClusterConfig::ComputeDevicesSharingHop(

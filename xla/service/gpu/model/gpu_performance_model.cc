@@ -139,6 +139,17 @@ bool IsRubin(const stream_executor::DeviceDescription& device_info) {
          absl::StrContains(lower_name, "rcpx");
 }
 
+// Calcium (q250) is a non-CUDA accelerator with LPDDR memory (308 GB/s) and
+// per-SoC peak ~98 TFLOPS FP8. It uses the same matrix-unit dispatch as
+// Blackwell/Rubin (peak FLOPS, sparse boost, saturation curve), but with a
+// LPDDR-tuned kKAPPA (see ComputeTimeFromPeakMatrixOps).
+bool IsCalcium(const stream_executor::DeviceDescription& device_info) {
+  auto name = device_info.name();
+  std::string lower_name = absl::AsciiStrToLower(name);
+  return absl::StrContains(lower_name, "q250") ||
+         absl::StrContains(lower_name, "calcium");
+}
+
 // Helper function to get Blackwell tensor core multiplier based on data type
 // Returns a multiplier relative to bf16 performance (1.0 = bf16 baseline)
 double GetBlackwellDataTypeMultiplier(const xla::HloInstruction* instr) {
@@ -286,12 +297,24 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
 
   // Apply same saturation model as WGMMA path for consistency.
   constexpr double kU_MAX = 0.80;
-  constexpr double kKAPPA = 0.04;
   constexpr double kF_REF = 1e12;
   constexpr double kU_MIN = 0.1;
+
+  // kKAPPA is per-arch: HBM-backed devices (Blackwell, Rubin) use 0.04 because
+  // their high memory bandwidth (~8 TB/s) lets compute saturate quickly with
+  // moderate FLOP counts. Calcium runs LPDDR (308 GB/s, ~26x lower), so
+  // small kernels become memory-bound far earlier; an HBM-tuned kKAPPA would
+  // systematically over-estimate Calcium's effective FLOPS. The 0.015 value
+  // is a conservative starting estimate; refine via Step 5b calibration once
+  // measured Calcium matmul timings are available.
+  constexpr double kKAPPA_DEFAULT = 0.04;     // HBM-tuned (Blackwell, Rubin)
+  constexpr double kKAPPA_CALCIUM = 0.015;    // LPDDR-tuned (Calcium / q250)
+  const double kappa =
+      IsCalcium(gpu_device_info) ? kKAPPA_CALCIUM : kKAPPA_DEFAULT;
+
   double utilization = std::max(
       kU_MIN,
-      kU_MAX * (1.0 - std::exp(-kKAPPA * static_cast<double>(flops) / kF_REF)));
+      kU_MAX * (1.0 - std::exp(-kappa * static_cast<double>(flops) / kF_REF)));
   double effective_ops_per_ns = static_cast<double>(peak_ops_per_ns) * utilization;
 
   // LOG(INFO) << "PeakMatrixOpsPerNs: " << peak_ops_per_ns
@@ -364,6 +387,16 @@ EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(
   } else if (IsRubin(device_info_)) {
     // Use peak matrix ops from .txtpb (R200/R200L200 have 2x ops_per_clock).
     // ComputeRubinTime() kept for reference/fallback.
+    double effective_ops_per_ns = 0.0;
+    compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr,
+                                                &effective_ops_per_ns);
+    if (effective_ops_per_ns > 0) {
+      effective_matrix_tflops = effective_ops_per_ns / 1000.0;  // ops/ns -> TFLOPS
+    }
+  } else if (IsCalcium(device_info_)) {
+    // Calcium (q250): non-CUDA accelerator, peak FLOPS from
+    // matrix_unit_description in q250.txtpb. Saturation curve uses
+    // LPDDR-tuned kKAPPA inside ComputeTimeFromPeakMatrixOps.
     double effective_ops_per_ns = 0.0;
     compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr,
                                                 &effective_ops_per_ns);

@@ -46,3 +46,8 @@ testlogs/*
 hlo/*
 xla/tools/hlo_opt/gpu_specs/*l200.txtpb
 
+# Calcium / q250 (non-CUDA accelerator) — spec is private, do not commit
+cebuq/
+xla/backends/gpu/target_config/specs/q250*.txtpb
+xla/service/gpu/model/configs/q250*.config
+

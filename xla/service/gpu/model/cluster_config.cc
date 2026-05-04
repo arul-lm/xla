@@ -334,12 +334,16 @@ GpuClusterConfig::PathBetweenDevices(int src_device_id,
 
   int scaleup_domain_size = scaleup_domain_.scaleup_device_count;
 
-  // Check if this is a B200, R200, RCPX, or B300 configuration (based on name pattern)
+  // Check if this is a B200, R200, RCPX, B300, or Calcium (q250) configuration
+  // (based on name pattern). q250 uses the 2-level stopgap path until Step 7
+  // introduces CalciumClusterConfig with proper 4-level fabric routing.
   if (name_pattern_.find("b200") != std::string::npos ||
       name_pattern_.find("r200") != std::string::npos ||
       name_pattern_.find("r576") != std::string::npos ||
       name_pattern_.find("rcpx") != std::string::npos ||
-      name_pattern_.find("b300") != std::string::npos) {
+      name_pattern_.find("b300") != std::string::npos ||
+      name_pattern_.find("q250") != std::string::npos ||
+      name_pattern_.find("calcium") != std::string::npos) {
     if (scaleup_src_coord.first == scaleup_dest_coord.first) {
       // Same scaleup domain - direct NvSwitch connection
       return {PathComponent::GPU, PathComponent::NvSwitch, PathComponent::GPU};
@@ -664,7 +668,11 @@ CreateClusterConfig(const std::string &device_type) {
              device_type.find("r200") != std::string::npos ||
              device_type.find("r576") != std::string::npos ||
              device_type.find("rcpx") != std::string::npos ||
-             device_type.find("b300") != std::string::npos) {
+             device_type.find("b300") != std::string::npos ||
+             device_type.find("q250") != std::string::npos ||
+             device_type.find("calcium") != std::string::npos) {
+    // Step 7 will introduce CalciumClusterConfig with 4-level fabric routing.
+    // Until then q250 falls through to the 2-level GpuClusterConfig stopgap.
     return std::make_unique<GpuClusterConfig>();
   } else {
     std::cerr << "ERROR: CreateClusterConfig - Unknown device type: "

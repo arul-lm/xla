@@ -1333,7 +1333,10 @@ CalciumClusterConfig::PathBetweenDevices(int64_t src, int64_t dst) const {
 
   if (is_l200_) {
     // q250l200: optical interposer (8-SoC pod) + rack-wide optical switch.
-    // Intra-pod: 1 hop direct GPU<->GPU on the interposer (no switch).
+    // SoCs are PathComponent::GPU here (the enum is shared across arches);
+    // see Calcium docs for the SoC naming.
+    //
+    // Intra-pod: 1 hop direct SoC<->SoC on the optical interposer.
     if (s.rack == d.rack && s.server == d.server && s.card == d.card &&
         s.l1_pod == d.l1_pod) {
       return {PathComponent::GPU, PathComponent::GPU};
@@ -1343,11 +1346,10 @@ CalciumClusterConfig::PathBetweenDevices(int64_t src, int64_t dst) const {
       return {PathComponent::GPU, PathComponent::OpticalSwitch,
               PathComponent::GPU};
     }
-    // Cross-rack: optical switch + L4 RoCE on each side.
-    return {PathComponent::GPU,           PathComponent::OpticalSwitch,
-            PathComponent::NIC,           PathComponent::ToRSwitch,
-            PathComponent::NIC,           PathComponent::OpticalSwitch,
-            PathComponent::GPU};
+    // Cross-rack: SoC -> NIC direct (the L4 RoCE NIC sits on a per-server
+    // egress plane, not behind the optical switch). 4 hops total.
+    return {PathComponent::GPU, PathComponent::NIC, PathComponent::ToRSwitch,
+            PathComponent::NIC, PathComponent::GPU};
   }
 
   // q250 (legacy 4-level PCIe + RoCE).
@@ -1386,14 +1388,17 @@ bool IsLink(PathComponent a, PathComponent b, PathComponent x, PathComponent y) 
 
 double CalciumClusterConfig::StaticLinkBandwidth(PathComponent a,
                                                  PathComponent b) const {
-  // q250l200 optical fabric edges. Both intra-pod direct and SoC<->switch
-  // are bounded by the SoC's single optical port BW.
+  // q250l200 optical fabric edges. Both intra-pod direct (SoC<->SoC on the
+  // interposer) and SoC<->switch are bounded by the SoC's single optical
+  // port BW.
   if (IsLink(a, b, PathComponent::GPU, PathComponent::GPU))
     return optical_port_bw_gbytes_;
   if (IsLink(a, b, PathComponent::GPU, PathComponent::OpticalSwitch))
     return optical_port_bw_gbytes_;
-  // q250l200 cross-rack: optical switch hands off to per-server NIC bundle.
-  if (IsLink(a, b, PathComponent::OpticalSwitch, PathComponent::NIC))
+  // q250l200 cross-rack: SoC connects directly to its server's L4 NIC
+  // (per-server bundle, 800 GB/s aggregate). Leaf cap (the SoC's egress
+  // port) is enforced separately in EffectiveBandwidth.
+  if (IsLink(a, b, PathComponent::GPU, PathComponent::NIC))
     return host_nic_link_bw_gbytes_;
   // q250 4-level PCIe + L4 RoCE.
   if (IsLink(a, b, PathComponent::GPU, PathComponent::L1Switch))
@@ -1420,8 +1425,8 @@ double CalciumClusterConfig::StaticOversubscription(PathComponent a,
     return l3_oversubscription_;
   if (IsLink(a, b, PathComponent::GPU, PathComponent::OpticalSwitch))
     return optical_switch_oversubscription_;
-  // GPU<->GPU interposer link, L1 (non-blocking), host-internal, L4 ToR
-  // uplinks, OpticalSwitch<->NIC: no internal oversub.
+  // SoC<->SoC interposer link (q250l200), L1 (non-blocking), host-internal,
+  // L4 ToR uplinks, SoC<->NIC: no internal oversub.
   return 1.0;
 }
 
@@ -1450,9 +1455,9 @@ double CalciumClusterConfig::EffectiveBandwidth(PathComponent a,
 int CalciumClusterConfig::ComputeDevicesSharingHop(
     PathComponent a, PathComponent b,
     const std::vector<int64_t> &device_ids) const {
-  // Per-SoC dedicated edges, never shared:
-  //   q250    : GPU<->L1Switch
-  //   q250l200: GPU<->GPU (interposer-direct), GPU<->OpticalSwitch
+  // Per-SoC dedicated edges, never shared (PathComponent::GPU is the SoC):
+  //   q250    : SoC<->L1Switch
+  //   q250l200: SoC<->SoC (interposer-direct), SoC<->OpticalSwitch
   if (IsLink(a, b, PathComponent::GPU, PathComponent::L1Switch)) return 1;
   if (IsLink(a, b, PathComponent::GPU, PathComponent::GPU)) return 1;
   if (IsLink(a, b, PathComponent::GPU, PathComponent::OpticalSwitch)) return 1;
@@ -1485,15 +1490,14 @@ int CalciumClusterConfig::ComputeDevicesSharingHop(
       return static_cast<int64_t>(c.server) * cards_per_server_ + c.card;
     });
   }
-  // L3<->NIC and NIC<->ToR: per-server egress, shared by all 192 SoCs on the
-  // server that participate in this collective. Same logic applies to the
-  // q250l200 OpticalSwitch<->NIC bundle (per-server NIC aggregate).
+  // L3<->NIC, NIC<->ToR (q250) and SoC<->NIC (q250l200): per-server egress,
+  // shared by all 192 SoCs on the server that participate in this
+  // collective. Group by (rack, server) so q250 (rack==0 always) collapses
+  // to per-server and q250l200 separates rack-by-rack.
   if (IsLink(a, b, PathComponent::L3Switch, PathComponent::NIC) ||
       IsLink(a, b, PathComponent::NIC, PathComponent::ToRSwitch) ||
-      IsLink(a, b, PathComponent::OpticalSwitch, PathComponent::NIC)) {
+      IsLink(a, b, PathComponent::GPU, PathComponent::NIC)) {
     return MaxGroupSize([this](CalciumCoord c) -> int64_t {
-      // Group by (rack, server). For q250 rack==0 always, so this collapses
-      // to per-server, matching the original behavior.
       return static_cast<int64_t>(c.rack) * servers_per_rack_ + c.server;
     });
   }

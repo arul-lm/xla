@@ -17,17 +17,22 @@ namespace stream_executor {
 // Forward declaration for CommCostStats
 struct CommCostStats;
 
-// Path component types for GPU communication.
+// Path component types for inter-device communication.
 //
 // The first six entries (GPU..CoreSwitch) are used by GpuClusterConfig and
 // must keep their current ordering. The remaining entries (L1Switch..
 // OpticalSwitch) are used exclusively by CalciumClusterConfig to model the
-// q250 4-level PCIe + L4 Ethernet fabric and the q250l200 rack-scale
-// optical fabric. They are unreachable from GpuClusterConfig::PathBetweenDevices
+// q250 4-level PCIe + L4 Ethernet fabric and the q250l200 hybrid optical
+// fabric. They are unreachable from GpuClusterConfig::PathBetweenDevices
 // (which only emits the first six), so existing arch behavior (TPU, B200,
 // B300, R200, R576, RCPX) is unaffected.
+//
+// PathComponent::GPU is the cross-arch enum and is used for the q250/q250l200
+// "SoC" device too. Calcium docs and user-facing artifacts render this as
+// "SOC" (the device is a System-on-Chip, not a GPU), but the enum stays
+// shared because the path-finding machinery is identical.
 enum class PathComponent {
-    GPU,
+    GPU,            // Calcium: SoC (System-on-Chip)
     NvSwitch,
     NIC,
     RailSwitch,

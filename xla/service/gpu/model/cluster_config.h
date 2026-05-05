@@ -20,11 +20,12 @@ struct CommCostStats;
 // Path component types for GPU communication.
 //
 // The first six entries (GPU..CoreSwitch) are used by GpuClusterConfig and
-// must keep their current ordering. The remaining four entries (L1Switch..
-// ToRSwitch) are used exclusively by CalciumClusterConfig to model the q250
-// 4-level PCIe + L4 Ethernet fabric. They are unreachable from
-// GpuClusterConfig::PathBetweenDevices (which only emits the first six),
-// so existing arch behavior (TPU, B200, B300, R200, R576, RCPX) is unaffected.
+// must keep their current ordering. The remaining entries (L1Switch..
+// OpticalSwitch) are used exclusively by CalciumClusterConfig to model the
+// q250 4-level PCIe + L4 Ethernet fabric and the q250l200 rack-scale
+// optical fabric. They are unreachable from GpuClusterConfig::PathBetweenDevices
+// (which only emits the first six), so existing arch behavior (TPU, B200,
+// B300, R200, R576, RCPX) is unaffected.
 enum class PathComponent {
     GPU,
     NvSwitch,
@@ -32,10 +33,11 @@ enum class PathComponent {
     RailSwitch,
     SpineSwitch,
     CoreSwitch,
-    L1Switch,    // Calcium: PCIe Gen5 x16 SoC <-> L1 switch (intra-pod)
-    L2Switch,    // Calcium: PCIe Gen6 x32 L1 <-> L2 switch (intra-card)
-    L3Switch,    // Calcium: PCIe Gen6 x64 L2 <-> L3 switch (intra-server)
-    ToRSwitch    // Calcium: Ethernet RoCE v2 NIC <-> ToR switch (inter-server)
+    L1Switch,       // Calcium q250: PCIe Gen5 x16 SoC <-> L1 switch (intra-pod)
+    L2Switch,       // Calcium q250: PCIe Gen6 x32 L1 <-> L2 switch (intra-card)
+    L3Switch,       // Calcium q250: PCIe Gen6 x64 L2 <-> L3 switch (intra-server)
+    ToRSwitch,      // Calcium: Ethernet RoCE v2 NIC <-> ToR switch (inter-server)
+    OpticalSwitch   // Calcium q250l200: rack-wide optical switch (cross-pod intra-rack)
 };
 
 // Communication type enum for node-level analysis
@@ -259,11 +261,19 @@ public:
 // Calcium (q250) physical coordinate: a single SoC's location in the
 // server -> card -> L1-pod -> SoC-in-pod hierarchy. Used by
 // CalciumClusterConfig::DecodeId and PathBetweenDevices.
+//
+// q250 (4-level PCIe fabric): rack=0 always; (server, card, l1_pod,
+//   soc_in_pod) carry the intra-rack coordinate.
+// q250l200 (rack-scale optical fabric): rack varies; (server, card, l1_pod)
+//   are derived from pod_in_rack solely for L4 NIC bundling on cross-rack
+//   paths. Intra-rack pairs are matched by (rack, server, card, l1_pod) for
+//   the same-pod test - see PathBetweenDevices.
 struct CalciumCoord {
-    int server;       // 0..N-1
-    int card;         // 0..7  (8 cards per server)
-    int l1_pod;       // 0..2  (3 L1 pods per card)
-    int soc_in_pod;   // 0..7  (8 SoCs per L1 pod)
+    int rack;         // 0..N-1   (q250l200: 0..6;  q250: 0)
+    int server;       // 0..6     (q250: physical; q250l200: pod_in_rack/24)
+    int card;         // 0..7     (q250: physical; q250l200: derived)
+    int l1_pod;       // 0..2     (q250: physical; q250l200: derived)
+    int soc_in_pod;   // 0..7     (always physical position within pod)
 };
 
 // CalciumClusterConfig: 4-level fabric (L1/L2/L3 PCIe + L4 Ethernet RoCE v2)
@@ -293,6 +303,16 @@ private:
     double host_nic_link_bw_gbytes_; // 800 GB/s aggregate
     double l4_per_card_egress_gbytes_; // 100 GB/s per card (the 5.12:1 cliff)
     double tor_switch_uplink_gbytes_;  // 800 GB/s
+
+    // q250l200 optical fabric (set when optical_port_bw_gbytes > 0). When
+    // is_l200_ is true, the L1/L2/L3 PCIe fields are NOT used by intra-rack
+    // path-finding; only optical_port + rack switch + L4 RoCE are emitted.
+    bool   is_l200_;
+    double optical_port_bw_gbytes_;            // 640 GB/s per-SoC optical port
+    double optical_switch_oversubscription_;   // typically 1.0 (non-blocking)
+    int    socs_per_rack_;                     // 1344
+    int    pods_per_rack_;                     // 168 = 1344/8
+    int    servers_per_rack_;                  // 7
 
     // Efficiency factors.
     double intranode_efficiency_factor_;

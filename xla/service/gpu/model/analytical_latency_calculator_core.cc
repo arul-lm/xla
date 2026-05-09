@@ -81,7 +81,18 @@ struct PipelineMetrics {
   int    pipeline_microbatches;
   int    devices_per_stage;
   double t_stage_us;          // per-stage compute+comm latency (one microbatch)
-  double t_handoff_us;         // inter-stage activation handoff latency
+  // Per-boundary handoff aggregates (Step 8b). t_handoff_us preserves the
+  // pre-Step-8b CSV column, set to t_handoff_avg_us so single-stage callers
+  // see the average per-boundary cost. T_step uses max; T_first / bubble use
+  // sum.
+  double t_handoff_us;         // average per-boundary handoff latency
+  double t_handoff_max_us;     // slowest boundary; drives T_step
+  double t_handoff_sum_us;     // sum over (S - 1) boundaries; drives T_first
+  // Inter-stage handoff/compute overlap factor in [0,1] actually applied.
+  // Distinct from the within-stage compute/comm `overlap_factor` carried in
+  // AnalyticalLatencyCalculatorOpts; they apply at different layers (intra-
+  // stage instruction overlap vs inter-stage handoff overlap).
+  double pipeline_comm_overlap_factor;
   double t_first_us;           // pipeline fill latency
   double t_step_us;            // steady-state per-microbatch latency
   double t_total_us;           // total runtime for M microbatches (0 if M==0)
@@ -104,28 +115,43 @@ int64_t InferActivationBytes(const xla::HloModule& hlo_module) {
 }
 
 // Compute pipeline-parallelism metrics from per-microbatch latencies and
-// pipeline configuration. Forward-only inference schedule:
-//   T_first    = num_stages * T_stage + (num_stages - 1) * T_handoff
-//   T_step     = max(T_stage, T_handoff)
-//   T_total(M) = T_first + (M - 1) * T_step  for M >= 1, else 0
-//   bubble_time = (num_stages - 1) * T_stage + (num_stages - 1) * T_handoff
-//                 (time spent during pipeline fill before steady-state)
+// per-boundary handoff aggregates. Forward-only inference schedule with
+// physical overlap semantics: pipeline_comm_overlap_factor only hides
+// handoff cost in steady-state cadence (T_step), NOT in the path of any
+// single microbatch through the pipe (T_first / bubble / TTFT). It is
+// distinct from the within-stage compute/comm `overlap_factor` that
+// already shaped t_stage_us before this function was called.
+//
+//   T_first    = num_stages * T_stage + raw_sum     <- mb 0 traversal cost
+//   T_step     = max(T_stage, eff_max)              <- with overlap
+//   T_total(M) = T_first + (M - 1) * T_step
+//   bubble     = (num_stages - 1) * T_stage + raw_sum
+//
+// where eff_k = raw_k * (1 - pipeline_comm_overlap_factor).
+//
+// For pipeline_comm_overlap_factor == 0.0, raw == eff and the formulas
+// collapse to the legacy T_first = S*T_stage + (S-1)*T_handoff form
+// (assuming uniform per-boundary cost). bound_by compares T_stage against
+// eff_max because cadence (not traversal) drives "compute vs comm"
+// classification.
 PipelineMetrics ComputePipelineMetrics(
     int num_pipeline_stages, int64_t pipeline_activation_bytes,
     int pipeline_microbatches, int devices_per_stage,
-    double t_stage_us, double t_handoff_us) {
+    double t_stage_us, const PipelineHandoffStats& handoffs) {
   PipelineMetrics m;
   m.num_pipeline_stages = num_pipeline_stages;
   m.pipeline_activation_bytes = pipeline_activation_bytes;
   m.pipeline_microbatches = pipeline_microbatches;
   m.devices_per_stage = devices_per_stage;
   m.t_stage_us = t_stage_us;
-  m.t_handoff_us = t_handoff_us;
+  m.t_handoff_us = handoffs.avg_us;
+  m.t_handoff_max_us = handoffs.max_us;       // effective max (drives T_step)
+  m.t_handoff_sum_us = handoffs.raw_sum_us;   // raw sum (drives T_first)
+  m.pipeline_comm_overlap_factor = handoffs.pipeline_comm_overlap_factor;
 
   const int S = std::max(1, num_pipeline_stages);
-  m.t_first_us = static_cast<double>(S) * t_stage_us +
-                 static_cast<double>(S - 1) * t_handoff_us;
-  m.t_step_us = std::max(t_stage_us, t_handoff_us);
+  m.t_first_us = static_cast<double>(S) * t_stage_us + handoffs.raw_sum_us;
+  m.t_step_us = std::max(t_stage_us, handoffs.max_us);
 
   if (pipeline_microbatches > 0) {
     m.t_total_us = m.t_first_us +
@@ -135,22 +161,25 @@ PipelineMetrics ComputePipelineMetrics(
     m.t_total_us = 0.0;
   }
 
-  m.bubble_time_us = static_cast<double>(S - 1) * t_stage_us +
-                     static_cast<double>(S - 1) * t_handoff_us;
+  m.bubble_time_us =
+      static_cast<double>(S - 1) * t_stage_us + handoffs.raw_sum_us;
   m.bubble_fraction = (m.t_total_us > 0.0)
                           ? (m.bubble_time_us / m.t_total_us)
                           : 0.0;
 
-  // bound_by classification: 10% threshold for "balanced".
-  if (t_stage_us <= 0.0 && t_handoff_us <= 0.0) {
+  // bound_by classification: 10% threshold for "balanced". Compare t_stage
+  // against the slowest effective boundary (handoff_max), since cadence
+  // (T_step) is what defines "compute vs comm" in steady state.
+  const double t_handoff_cadence = handoffs.max_us;
+  if (t_stage_us <= 0.0 && t_handoff_cadence <= 0.0) {
     m.bound_by = "balanced";
   } else {
-    const double max_v = std::max(t_stage_us, t_handoff_us);
-    const double min_v = std::min(t_stage_us, t_handoff_us);
+    const double max_v = std::max(t_stage_us, t_handoff_cadence);
+    const double min_v = std::min(t_stage_us, t_handoff_cadence);
     const double ratio = (max_v > 0.0) ? (min_v / max_v) : 1.0;
     if (ratio >= 0.9) {
       m.bound_by = "balanced";
-    } else if (t_stage_us > t_handoff_us) {
+    } else if (t_stage_us > t_handoff_cadence) {
       m.bound_by = "compute";
     } else {
       m.bound_by = "comm";
@@ -1042,6 +1071,13 @@ absl::Status RunAnalyticalLatencyCalculation(
 
   // Pipeline-parallelism stats (Calcium-only). Header is appended only if a
   // PP run actually produces rows; the file is written only in that case.
+  // Step 8b: t_handoff_us preserves the legacy column (now equals the
+  // average per-boundary handoff). Three new columns at the end -
+  // t_handoff_max_us, t_handoff_sum_us, pipeline_comm_overlap_factor -
+  // expose the per-boundary aggregates that drive T_step / T_first
+  // respectively. The column is named pipeline_comm_overlap_factor (not
+  // just comm_overlap_factor) to disambiguate from the existing within-
+  // stage compute/comm overlap_factor; the two operate at different layers.
   std::vector<std::string> pipeline_stats_header = {
       "device_name",
       "hw_arch",
@@ -1056,7 +1092,10 @@ absl::Status RunAnalyticalLatencyCalculation(
       "t_total_us",
       "bubble_time_us",
       "bubble_fraction",
-      "bound_by"};
+      "bound_by",
+      "t_handoff_max_us",
+      "t_handoff_sum_us",
+      "pipeline_comm_overlap_factor"};
 
   // Infer module format from file extension. .mlir is treated as HLO text (the
   // file content is a HLO variant, not MLIR/MHLO). Other extensions map to
@@ -1738,13 +1777,16 @@ absl::Status RunAnalyticalLatencyCalculation(
         }
 
         const double t_stage_us = overlap_stats.original_total_time_us;
-        const double t_handoff_us = calcium->CalculatePipelineHandoffCost(
-            activation_bytes, devices_per_stage);
+        const PipelineHandoffStats handoffs =
+            calcium->CalculatePipelineHandoffCosts(
+                activation_bytes, devices_per_stage,
+                opts.num_pipeline_stages,
+                opts.pipeline_comm_overlap_factor);
 
         PipelineMetrics pm = ComputePipelineMetrics(
             opts.num_pipeline_stages, activation_bytes,
             opts.pipeline_microbatches, devices_per_stage, t_stage_us,
-            t_handoff_us);
+            handoffs);
 
         pipeline_stats_data.push_back({
             device_name,
@@ -1761,6 +1803,9 @@ absl::Status RunAnalyticalLatencyCalculation(
             std::to_string(pm.bubble_time_us),
             std::to_string(pm.bubble_fraction),
             pm.bound_by,
+            std::to_string(pm.t_handoff_max_us),
+            std::to_string(pm.t_handoff_sum_us),
+            std::to_string(pm.pipeline_comm_overlap_factor),
         });
 
         llvm::outs() << "=== Pipeline Parallelism (Calcium) ===\n";
@@ -1772,14 +1817,18 @@ absl::Status RunAnalyticalLatencyCalculation(
                      << pm.pipeline_activation_bytes << "\n";
         llvm::outs() << "  devices_per_stage: " << pm.devices_per_stage
                      << "\n";
-        llvm::outs() << "  t_stage_us:   " << pm.t_stage_us << "\n";
-        llvm::outs() << "  t_handoff_us: " << pm.t_handoff_us << "\n";
-        llvm::outs() << "  t_first_us:   " << pm.t_first_us << "\n";
-        llvm::outs() << "  t_step_us:    " << pm.t_step_us << "\n";
-        llvm::outs() << "  t_total_us:   " << pm.t_total_us << "\n";
-        llvm::outs() << "  bubble_time_us:  " << pm.bubble_time_us << "\n";
-        llvm::outs() << "  bubble_fraction: " << pm.bubble_fraction << "\n";
-        llvm::outs() << "  bound_by:        " << pm.bound_by << "\n";
+        llvm::outs() << "  t_stage_us:        " << pm.t_stage_us << "\n";
+        llvm::outs() << "  t_handoff_avg_us:  " << pm.t_handoff_us << "\n";
+        llvm::outs() << "  t_handoff_max_us:  " << pm.t_handoff_max_us << "\n";
+        llvm::outs() << "  t_handoff_sum_us:  " << pm.t_handoff_sum_us << "\n";
+        llvm::outs() << "  pipeline_comm_overlap_factor: "
+                     << pm.pipeline_comm_overlap_factor << "\n";
+        llvm::outs() << "  t_first_us:        " << pm.t_first_us << "\n";
+        llvm::outs() << "  t_step_us:         " << pm.t_step_us << "\n";
+        llvm::outs() << "  t_total_us:        " << pm.t_total_us << "\n";
+        llvm::outs() << "  bubble_time_us:    " << pm.bubble_time_us << "\n";
+        llvm::outs() << "  bubble_fraction:   " << pm.bubble_fraction << "\n";
+        llvm::outs() << "  bound_by:          " << pm.bound_by << "\n";
         llvm::outs() << "======================================\n";
         llvm::outs().flush();
       }

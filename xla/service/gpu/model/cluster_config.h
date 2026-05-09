@@ -75,6 +75,48 @@ struct CommCostStats {
   double per_link_cost_us;   // Cost per link in microseconds
 };
 
+// Per-boundary pipeline handoff cost statistics. Produced by
+// CalciumClusterConfig::CalculatePipelineHandoffCosts. All times are in
+// microseconds and include 1-us-per-hop latency adders.
+//
+// Two views are exposed because they have different physical meanings:
+//
+//  - "raw" values are the full handoff cost on the critical path of a
+//    single microbatch (no overlap can hide any of it, because microbatch m
+//    cannot start stage k+1 until its own handoff completes). T_first /
+//    pipeline-fill / single-microbatch traversal cost uses these.
+//
+//  - "effective" values are the raw values multiplied by
+//    (1 - pipeline_comm_overlap_factor). They model how much of each
+//    handoff is hidden behind the NEXT microbatch's compute on the
+//    previous stage in steady state. T_step (cadence) and steady-state
+//    throughput use these.
+//
+// `pipeline_comm_overlap_factor` is distinct from the within-stage
+// compute/communication `overlap_factor` used by
+// CalculateInstructionLevelOverlap (which controls how t_stage_us itself
+// is computed from the per-instruction compute and comm times). The
+// pipeline factor controls only inter-stage handoff hiding.
+//
+// For pipeline_comm_overlap_factor == 0.0 the two views are identical
+// (byte-stable pre-Step-8b behavior).
+struct PipelineHandoffStats {
+  // Effective values (after applying (1 - pipeline_comm_overlap_factor)).
+  double max_us = 0.0;               // Slowest boundary; drives T_step.
+  double sum_us = 0.0;               // Sum across boundaries; convenience only.
+  double avg_us = 0.0;               // sum_us / num_boundaries (diagnostic).
+
+  // Raw values (no overlap applied). Drive T_first / bubble / per-microbatch
+  // pipeline traversal time.
+  double raw_max_us = 0.0;
+  double raw_sum_us = 0.0;
+
+  int    num_boundaries = 0;              // num_pipeline_stages - 1.
+  double pipeline_comm_overlap_factor = 0.0;  // Factor actually applied [0,1].
+  std::vector<double> per_boundary_us;    // Effective per-boundary cost.
+  std::vector<double> per_boundary_raw_us;// Raw per-boundary cost.
+};
+
 // Base class for cluster configurations
 class ClusterConfig {
 public:
@@ -378,8 +420,42 @@ public:
     // Step 8 (PP): inter-stage handoff cost between rank-0 SoC of stage 0
     // and rank-0 SoC of stage 1. Uses PathBetweenDevices + EffectiveBandwidth.
     // P2P (1-to-1), so sharing=1 on every hop.
+    //
+    // Kept for ABI/API compatibility with pre-Step-8b callers. Equivalent to
+    // CalculatePipelineHandoffCosts(activation_bytes, devices_per_stage,
+    //                               /*num_pipeline_stages=*/2,
+    //                               /*pipeline_comm_overlap_factor=*/0.0).max_us
+    // for any layout where every stage boundary lands on the same path tier
+    // (i.e. when devices_per_stage divides cleanly into the q250 hierarchy).
+    // Otherwise it returns the cost of the FIRST boundary only, which can
+    // under-estimate cadence; new code should call the per-boundary variant.
     double CalculatePipelineHandoffCost(int64_t activation_bytes,
                                         int devices_per_stage) const;
+
+    // Step 8b (PP): per-boundary handoff cost. Computes one handoff for each
+    // of the (num_pipeline_stages - 1) stage boundaries, walking
+    //   (k, k+1) -> (src = k * devices_per_stage, dst = (k+1) * devices_per_stage)
+    // for k in [0, S-2]. Each boundary uses sharing=1 (P2P) and the leaf-
+    // bandwidth-aware EffectiveBandwidth on its own path.
+    //
+    // pipeline_comm_overlap_factor in [0.0, 1.0] models inter-stage
+    // compute/handoff overlap: the visible per-boundary cost is multiplied
+    // by (1 - pipeline_comm_overlap_factor). 0.0 = no overlap (legacy);
+    // 0.5 = typical 1F1B-style overlap with the next stage's compute;
+    // 1.0 = handoff fully hidden. This is distinct from the within-stage
+    // compute/comm `overlap_factor` used by CalculateInstructionLevelOverlap
+    // - they apply at different layers of the model (intra-stage instruction
+    // overlap vs inter-stage handoff overlap) and compose multiplicatively.
+    //
+    // Returns max/sum/avg over the S-1 boundaries plus the per-boundary
+    // vector for diagnostics. Aggregation semantics:
+    //   T_step  uses .max_us  (slowest boundary drives steady-state cadence)
+    //   T_first uses .raw_sum_us (fill phase pays each boundary in full)
+    //   bubble  uses .raw_sum_us
+    PipelineHandoffStats CalculatePipelineHandoffCosts(
+        int64_t activation_bytes, int devices_per_stage,
+        int num_pipeline_stages,
+        double pipeline_comm_overlap_factor) const;
 
     // Determine CommType from a Calcium path. Used by CSV export.
     CommType DetermineCommTypeFromPath(const std::vector<PathComponent>& path) const;

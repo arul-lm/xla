@@ -1506,24 +1506,75 @@ int CalciumClusterConfig::ComputeDevicesSharingHop(
 
 double CalciumClusterConfig::CalculatePipelineHandoffCost(
     int64_t activation_bytes, int devices_per_stage) const {
-  if (devices_per_stage <= 0 || activation_bytes <= 0) return 0.0;
+  // Backward-compatible wrapper: single boundary, no overlap. Equivalent to
+  // the per-boundary computation for k=0 only. For S=2 this is exact; for
+  // S>2 callers should switch to CalculatePipelineHandoffCosts(...) so the
+  // slowest boundary drives steady-state cadence.
+  PipelineHandoffStats s = CalculatePipelineHandoffCosts(
+      activation_bytes, devices_per_stage,
+      /*num_pipeline_stages=*/2,
+      /*pipeline_comm_overlap_factor=*/0.0);
+  return s.max_us;
+}
 
-  const int64_t src = 0;
-  const int64_t dst = devices_per_stage;
-  std::vector<PathComponent> path = PathBetweenDevices(src, dst);
-  if (path.size() < 2) return 0.0;
-
-  // P2P (1-to-1) handoff: sharing=1 on every hop.
-  double bottleneck_gbps = std::numeric_limits<double>::infinity();
-  for (size_t i = 0; i + 1 < path.size(); ++i) {
-    double bw = EffectiveBandwidth(path[i], path[i + 1], /*sharing=*/1);
-    if (bw < bottleneck_gbps) bottleneck_gbps = bw;
+PipelineHandoffStats CalciumClusterConfig::CalculatePipelineHandoffCosts(
+    int64_t activation_bytes, int devices_per_stage,
+    int num_pipeline_stages, double pipeline_comm_overlap_factor) const {
+  PipelineHandoffStats out;
+  out.pipeline_comm_overlap_factor =
+      std::min(1.0, std::max(0.0, pipeline_comm_overlap_factor));
+  if (devices_per_stage <= 0 || activation_bytes <= 0 ||
+      num_pipeline_stages < 2) {
+    return out;
   }
-  if (!std::isfinite(bottleneck_gbps) || bottleneck_gbps <= 0.0) return 0.0;
+  const int boundaries = num_pipeline_stages - 1;
+  out.num_boundaries = boundaries;
+  out.per_boundary_us.reserve(boundaries);
+  out.per_boundary_raw_us.reserve(boundaries);
 
-  const double effective_bw = bottleneck_gbps * internode_efficiency_factor_;
-  // bytes -> GB -> seconds -> microseconds.
-  return (static_cast<double>(activation_bytes) / 1e9) / effective_bw * 1e6;
+  for (int k = 0; k < boundaries; ++k) {
+    const int64_t src = static_cast<int64_t>(k) * devices_per_stage;
+    const int64_t dst =
+        static_cast<int64_t>(k + 1) * devices_per_stage;
+    const std::vector<PathComponent> path = PathBetweenDevices(src, dst);
+    if (path.size() < 2) {
+      out.per_boundary_us.push_back(0.0);
+      out.per_boundary_raw_us.push_back(0.0);
+      continue;
+    }
+    double bottleneck_gbps = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+      // P2P (1-to-1) handoff: sharing=1 on every hop.
+      const double bw =
+          EffectiveBandwidth(path[i], path[i + 1], /*sharing=*/1);
+      if (bw < bottleneck_gbps) bottleneck_gbps = bw;
+    }
+    if (!std::isfinite(bottleneck_gbps) || bottleneck_gbps <= 0.0) {
+      out.per_boundary_us.push_back(0.0);
+      out.per_boundary_raw_us.push_back(0.0);
+      continue;
+    }
+    const double eff_bw = bottleneck_gbps * internode_efficiency_factor_;
+    const double bytes_us =
+        (static_cast<double>(activation_bytes) / 1e9) / eff_bw * 1e6;
+    const double hops_us =
+        static_cast<double>(path.size() - 1) * 1.0;  // 1 us per hop.
+    const double t_raw = bytes_us + hops_us;
+    const double t_eff = t_raw * (1.0 - out.pipeline_comm_overlap_factor);
+    out.per_boundary_us.push_back(t_eff);
+    out.per_boundary_raw_us.push_back(t_raw);
+  }
+
+  for (double t : out.per_boundary_us) {
+    out.sum_us += t;
+    if (t > out.max_us) out.max_us = t;
+  }
+  for (double t : out.per_boundary_raw_us) {
+    out.raw_sum_us += t;
+    if (t > out.raw_max_us) out.raw_max_us = t;
+  }
+  out.avg_us = (boundaries > 0) ? (out.sum_us / boundaries) : 0.0;
+  return out;
 }
 
 CommType CalciumClusterConfig::DetermineCommTypeFromPath(

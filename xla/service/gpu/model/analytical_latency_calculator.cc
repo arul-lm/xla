@@ -16,6 +16,7 @@ int main(int argc, char *argv[]) {
   std::string hardware_architectures_str;
   std::string output_path_prefix;
   std::string scale_memory_bandwidth_str = "1.0";
+  std::string pipeline_comm_overlap_factor_str = "0.0";
   std::vector<tsl::Flag> flag_list = {
       tsl::Flag("hlo-module-file", &opts.hlo_module_file,
                 "Path to HLO module file (required)"),
@@ -49,7 +50,14 @@ int main(int argc, char *argv[]) {
                 "auto-infer from HLO entry-computation parameter shapes."),
       tsl::Flag("pipeline-microbatches", &opts.pipeline_microbatches,
                 "Number of microbatches in the pipeline step. 0 reports "
-                "per-microbatch metrics only.")};
+                "per-microbatch metrics only."),
+      // Step 8b. 0.0 keeps pre-Step-8b behavior (no overlap modeled).
+      tsl::Flag("pipeline-comm-overlap-factor",
+                &pipeline_comm_overlap_factor_str,
+                "Inter-stage compute/handoff overlap factor in [0.0, 1.0] "
+                "(Calcium-only). The visible per-boundary handoff cost is "
+                "multiplied by (1 - factor). 0.0 = no overlap (default, "
+                "byte-stable). 0.5 = typical 1F1B-style overlap.")};
   xla::AppendDebugOptionsFlags(&flag_list);
   std::string usage_string = tsl::Flags::Usage(argv[0], flag_list);
   if (!tsl::Flags::Parse(&argc, argv, flag_list)) {
@@ -117,6 +125,20 @@ int main(int argc, char *argv[]) {
       llvm::outs() << "Error: scale-memory-bandwidth must be a positive number, "
                       "got: "
                    << scale_memory_bandwidth_str << "\n";
+      return 1;
+    }
+  }
+
+  // Parse pipeline_comm_overlap_factor (optional, default 0.0). Step 8b.
+  if (!pipeline_comm_overlap_factor_str.empty()) {
+    char *end_ptr;
+    opts.pipeline_comm_overlap_factor =
+        std::strtod(pipeline_comm_overlap_factor_str.c_str(), &end_ptr);
+    if (*end_ptr != '\0' || opts.pipeline_comm_overlap_factor < 0.0 ||
+        opts.pipeline_comm_overlap_factor > 1.0) {
+      llvm::outs() << "Error: pipeline-comm-overlap-factor must be a valid "
+                      "number between 0.0 and 1.0, got: "
+                   << pipeline_comm_overlap_factor_str << "\n";
       return 1;
     }
   }

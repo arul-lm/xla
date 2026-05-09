@@ -63,6 +63,7 @@ int analytical_latency_calculator_run_with_pipeline(
     int num_pipeline_stages,
     int64_t pipeline_activation_bytes,
     int pipeline_microbatches,
+    double pipeline_comm_overlap_factor,
     char* error_buffer,
     size_t error_buffer_size) {
   if (hlo_module_file == nullptr || std::strlen(hlo_module_file) == 0) {
@@ -108,6 +109,8 @@ int analytical_latency_calculator_run_with_pipeline(
       (pipeline_activation_bytes > 0) ? pipeline_activation_bytes : 0;
   opts.pipeline_microbatches =
       (pipeline_microbatches > 0) ? pipeline_microbatches : 0;
+  // Step 8b: comm overlap factor. Clamped to [0,1] inside the cluster config.
+  opts.pipeline_comm_overlap_factor = pipeline_comm_overlap_factor;
 
   std::string output_prefix_str;  // empty: output_dir is absolute or relative to cwd
 
@@ -213,6 +216,7 @@ int analytical_latency_calculator_run(
       /*num_pipeline_stages=*/1,
       /*pipeline_activation_bytes=*/0,
       /*pipeline_microbatches=*/0,
+      /*pipeline_comm_overlap_factor=*/0.0,
       error_buffer, error_buffer_size);
 }
 

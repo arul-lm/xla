@@ -12,10 +12,10 @@ Two C entry points are exported:
 
 | Function | Use it when |
 |----------|-------------|
-| **`analytical_latency_calculator_run`** | You want the legacy behavior (no pipeline parallelism). All architectures are supported and assume `PP=1`. **ABI-stable**: signature has not changed since this function was introduced. |
-| **`analytical_latency_calculator_run_with_pipeline`** | You want pipeline-parallelism modeling for the Calcium (`q250`) architecture, with bubble accounting and a `pipeline_stats.csv` output. Setting `num_pipeline_stages <= 1` makes this function byte-identical to `analytical_latency_calculator_run`. |
+| **`analytical_latency_calculator_run`** | You want the legacy behavior (no pipeline parallelism). All architectures are supported and assume `PP=1`. **ABI-stable**: signature has not changed since this function was introduced. Forwards internally to `analytical_latency_calculator_run_with_pipeline` with `num_pipeline_stages = 1` and `pipeline_comm_overlap_factor = 0.0`. |
+| **`analytical_latency_calculator_run_with_pipeline`** | You want pipeline-parallelism modeling for the Calcium (`q250`) architecture, with bubble accounting and a `pipeline_stats.csv` output. Includes a `pipeline_comm_overlap_factor` knob in `[0.0, 1.0]` for inter-stage compute/handoff overlap (`0.0` = no overlap, byte-stable with pre-Step-8b runs). Setting `num_pipeline_stages <= 1` makes this function byte-identical to `analytical_latency_calculator_run`. |
 
-Both symbols are exported from the FFI shared libraries (verify with `nm -D libanalytical_latency_ffi.so | grep analytical_latency`). New callers should prefer `analytical_latency_calculator_run_with_pipeline` because it is a strict superset.
+Both symbols are exported from the FFI shared libraries (verify with `nm -D libanalytical_latency_ffi.so | grep analytical_latency`). The `_with_pipeline` signature gained `pipeline_comm_overlap_factor` in Step 8b — pre-existing callers of that symbol must recompile against the new header. The legacy `_run` symbol is unchanged.
 
 ---
 
@@ -66,14 +66,15 @@ int analytical_latency_calculator_run_with_pipeline(
     int fix_ragged_dot_flops,
     int dump_modified_module,
     double scale_memory_bandwidth,
-    int     num_pipeline_stages,        /* new: 0 or 1 = no PP modeling */
-    int64_t pipeline_activation_bytes,  /* new: 0 = auto-infer from HLO */
-    int     pipeline_microbatches,      /* new: 0 = per-microbatch only */
+    int     num_pipeline_stages,           /* 0 or 1 = no PP modeling */
+    int64_t pipeline_activation_bytes,     /* 0 = auto-infer from HLO */
+    int     pipeline_microbatches,         /* 0 = per-microbatch only */
+    double  pipeline_comm_overlap_factor,  /* 0.0-1.0, 0.0 = no overlap */
     char* error_buffer,
     size_t error_buffer_size);
 ```
 
-The first nine parameters and the trailing `error_buffer` / `error_buffer_size` are identical to the legacy entry point. The three middle parameters (`num_pipeline_stages`, `pipeline_activation_bytes`, `pipeline_microbatches`) control pipeline-parallelism modeling.
+The first nine parameters and the trailing `error_buffer` / `error_buffer_size` are identical to the legacy entry point. The four middle parameters control pipeline-parallelism modeling. `pipeline_comm_overlap_factor` was added in Step 8b — pre-existing callers must recompile against the new header. Setting `num_pipeline_stages <= 1` (and any value for the others) makes this function byte-identical to `analytical_latency_calculator_run`.
 
 ---
 
@@ -88,7 +89,7 @@ The first nine parameters and the trailing `error_buffer` / `error_buffer_size` 
 | **output_dir** | `const char*` | Yes | Directory where CSV files are written. Can be absolute or relative to the current working directory. Created if it does not exist. |
 | **gpu_model_data_root** | `const char*` | Yes | Root for model data. Specs are loaded from `{gpu_model_data_root}/xla/backends/gpu/target_config/specs/{arch}.txtpb`, cluster configs from `{gpu_model_data_root}/xla/service/gpu/model/configs/{arch}.config`. |
 | **mesh_shape** | `const char*` | Yes | Exactly three positive integers, comma-separated (e.g. `"1,72,1"` or `"4,4,4"`). No spaces required; leading/trailing whitespace is trimmed per dimension. |
-| **overlap_factor** | `double` | Yes | Compute–communication overlap factor in **[0.0, 1.0]**. Same meaning as CLI `--overlap-factor`. |
+| **overlap_factor** | `double` | Yes | **Within-stage** compute–communication overlap factor in **[0.0, 1.0]**. Controls how much within-stage comm hides behind within-stage compute when computing `t_stage_us` (one microbatch on one stage). Same meaning as CLI `--overlap-factor`. **Different from `pipeline_comm_overlap_factor`** — see [Two distinct overlap factors](#two-distinct-overlap-factors). |
 | **fix_ragged_dot_flops** | `int` | Yes | Boolean: **0** = false, **non-zero** = true. Same as CLI `--fix-ragged-dot-flops`. |
 | **dump_modified_module** | `int` | Yes | Boolean: **0** = false, **non-zero** = true. If true, writes the (possibly modified) HLO module to `modified_module.hlo` in `output_dir`. Same as CLI `--dump-modified-module`. |
 | **scale_memory_bandwidth** | `double` | Yes | Scale factor for device memory bandwidth. **1.0** = no change. Must be **> 0**. Use e.g. **10.0** to simulate 10× bandwidth (useful to check if a workload is memory-bound). See [How scale_memory_bandwidth is applied](#how-scale_memory_bandwidth-is-applied) below. |
@@ -102,8 +103,47 @@ The first nine parameters and the trailing `error_buffer` / `error_buffer_size` 
 | **num_pipeline_stages** | `int` | Yes (use `1` for default) | Number of pipeline stages. **`0` or `1`** disables PP modeling and outputs are byte-identical to `analytical_latency_calculator_run`. **`> 1`** enables PP modeling and is **only valid for Calcium (`q250`)**; other architectures return an error. |
 | **pipeline_activation_bytes** | `int64_t` | Yes (use `0` for default) | Byte size of the activation handed off between consecutive pipeline stages. **`0`** auto-infers from the HLO entry-computation parameter shapes (sum of `xla::ShapeUtil::ByteSizeOf` over all parameters). For training (forward + backward) pass `2 * forward_size` explicitly. |
 | **pipeline_microbatches** | `int` | Yes (use `0` for default) | Number of microbatches per pipeline step. **`0`** reports per-microbatch metrics only (`t_total_us = 0` in `pipeline_stats.csv`); **`> 0`** computes the full pipeline runtime including bubble fraction. |
+| **pipeline_comm_overlap_factor** | `double` | Yes (use `0.0` for default) | Inter-stage compute/handoff overlap factor in `[0.0, 1.0]`. The visible per-boundary handoff cost is multiplied by `(1 - factor)`. `0.0` = no overlap, conservative (and byte-stable with pre-Step-8b runs). `0.5` ≈ typical 1F1B-style overlap with the next stage's compute. `1.0` = handoff fully hidden in cadence. Out-of-range values are clamped. |
 
-The HLO module passed to `_with_pipeline` is interpreted as **one pipeline stage**. The calculator multiplies by `num_pipeline_stages` and accounts for inter-stage activation handoff cost using the Calcium 4-level fabric model in `CalciumClusterConfig::CalculatePipelineHandoffCost`.
+The HLO module passed to `_with_pipeline` is interpreted as **one pipeline stage**. The calculator multiplies by `num_pipeline_stages` and computes a **per-boundary** handoff cost via `CalciumClusterConfig::CalculatePipelineHandoffCosts`: for each `k ∈ [0, S-2]` it walks `PathBetweenDevices(k * devices_per_stage, (k+1) * devices_per_stage)`, takes the bottleneck `EffectiveBandwidth(...)` with `sharing=1`, applies the `internode_efficiency_factor`, adds 1-µs-per-hop latency, and exposes two views:
+
+- **raw**: the unmodified per-boundary handoff cost (no overlap applied). This is the cost on the critical path of any single microbatch, since a microbatch cannot enter stage `k+1` until its own handoff `k → k+1` finishes.
+- **effective**: raw × `(1 - pipeline_comm_overlap_factor)`. This models how much of each handoff is hidden behind the **next** microbatch's compute on stage `k` in steady state.
+
+Pipeline-level metrics use these views differently — overlap helps cadence but cannot help any single microbatch's traversal cost:
+
+```
+T_first    = num_stages * T_stage  +  t_handoff_raw_sum    (mb 0 traversal)
+T_step     = max(T_stage, t_handoff_max)                   (steady-state cadence)
+T_total(M) = T_first + (M - 1) * T_step                    for M >= 1, else 0
+bubble     = (num_stages - 1) * T_stage  +  t_handoff_raw_sum
+```
+
+The exposed columns:
+
+| Column | View | Meaning |
+|--------|------|---------|
+| `t_handoff_max_us` | effective | Slowest effective boundary; drives `T_step`. |
+| `t_handoff_sum_us` | **raw** | Sum of raw per-boundary costs; drives `T_first` and `bubble_time`. (Note: this is the **raw** sum, not the effective sum, because `T_first` cannot be hidden by overlap.) |
+| `t_handoff_us` | effective | Average effective per-boundary handoff; diagnostic only. |
+| `pipeline_comm_overlap_factor` | — | The factor actually applied. |
+
+For `pipeline_comm_overlap_factor = 0.0` the raw and effective views are identical and the metrics collapse to the legacy `T_first = S*T_stage + (S-1)*T_handoff` form (assuming uniform per-boundary cost), which preserves byte-stable v1 output.
+
+`bound_by` compares `T_stage` against `t_handoff_max` (the cadence-relevant **effective** value) — `compute` / `comm` / `balanced` with a 10% threshold.
+
+### Two distinct overlap factors
+
+The PP path has **two independent overlap knobs** that operate at different layers of the model. Both are scalars in `[0.0, 1.0]` and both default to `0.0`, but they mean very different things:
+
+| Knob | Layer | What it overlaps | Affects |
+|---|---|---|---|
+| **`overlap_factor`** | Within a single stage | The HLO's per-instruction **compute** with the HLO's per-instruction **comm** (e.g. AllReduce). Computed by `CalculateInstructionLevelOverlap`. | `t_stage_us` (per-microbatch-per-stage cost). Through that, indirectly affects everything downstream. |
+| **`pipeline_comm_overlap_factor`** | Between pipeline stages | The **inter-stage activation handoff** with the **next microbatch's compute on the previous stage** in steady state. Applied as `(1 − factor)` to the per-boundary raw handoff. | `t_step_us` only. `t_first_us`, `bubble_time_us`, and any single microbatch's traversal cost use the **raw** handoff regardless of this factor — microbatch 0 in particular cannot hide its own handoffs because it has no predecessor in the pipe. |
+
+They compose multiplicatively: `overlap_factor` first shapes `t_stage_us`; `pipeline_comm_overlap_factor` then shapes `t_step_us` from `t_stage_us` and the per-boundary handoffs. A run with `overlap_factor = 0.7, pipeline_comm_overlap_factor = 0.5` is modelling "70% of within-stage comm hides behind within-stage compute, AND 50% of each inter-stage handoff hides behind the next microbatch's compute".
+
+The CSV column **`pipeline_comm_overlap_factor`** records only the second knob. The first knob is implicitly baked into `t_stage_us` and is not echoed in `pipeline_stats.csv` (it appears in `overlap_stats.csv`).
 
 ---
 
@@ -151,7 +191,7 @@ The same CSV and HLO files as the CLI are produced under `output_dir`:
 - `modified_module.hlo` (only if `dump_modified_module` is non-zero)
 - **`pipeline_stats.csv`** (only if `_with_pipeline` was called with `num_pipeline_stages > 1` **and** at least one Calcium architecture was processed)
 
-`pipeline_stats.csv` columns:
+`pipeline_stats.csv` columns (Step 8b adds the last three; the existing columns are unchanged in name and order, so v1 CSV consumers keep working):
 
 | Column | Meaning |
 |--------|---------|
@@ -162,13 +202,16 @@ The same CSV and HLO files as the CLI are produced under `output_dir`:
 | `pipeline_activation_bytes` | The value used (auto-inferred when input was 0). |
 | `devices_per_stage` | `product(mesh_shape)`. |
 | `t_stage_us` | Per-microbatch stage latency = `overlap_stats.original_total_time_us` for the HLO. |
-| `t_handoff_us` | Inter-stage P2P activation handoff cost on the Calcium fabric (computed by `CalciumClusterConfig::CalculatePipelineHandoffCost`). |
-| `t_first_us` | Pipeline fill latency = `S * t_stage + (S-1) * t_handoff`. |
-| `t_step_us` | Steady-state per-microbatch latency = `max(t_stage, t_handoff)`. |
-| `t_total_us` | Total runtime for `M` microbatches = `t_first + (M-1) * t_step`; `0` when `pipeline_microbatches == 0`. |
-| `bubble_time_us` | Pipeline-fill bubble time = `(S-1) * t_stage + (S-1) * t_handoff`. |
+| `t_handoff_us` | **Average effective** per-boundary handoff cost (Step 8b: was the single rank-0→rank-D handoff). For `pipeline_comm_overlap_factor = 0` and uniform per-boundary cost, identical to v1. |
+| `t_first_us` | Pipeline fill latency = `S * t_stage + t_handoff_sum_us` (using **raw** sum — overlap cannot hide microbatch 0's traversal). |
+| `t_step_us` | Steady-state per-microbatch latency = `max(t_stage, t_handoff_max_us)`. |
+| `t_total_us` | Total runtime for `M` microbatches = `t_first_us + (M-1) * t_step_us`; `0` when `pipeline_microbatches == 0`. |
+| `bubble_time_us` | Pipeline-fill bubble time = `(S-1) * t_stage + t_handoff_sum_us`. |
 | `bubble_fraction` | `bubble_time_us / t_total_us`; `0` when `t_total_us == 0`. |
-| `bound_by` | `compute` (stage dominates), `comm` (handoff dominates), or `balanced` (within 10% ratio). |
+| `bound_by` | `compute` (stage dominates), `comm` (handoff dominates), or `balanced` (within 10% ratio). Compares `t_stage` against `t_handoff_max_us` (effective). |
+| `t_handoff_max_us` | **(Step 8b)** Slowest of the `S-1` **effective** per-boundary handoffs; drives `t_step_us`. |
+| `t_handoff_sum_us` | **(Step 8b)** Sum of all `S-1` **raw** per-boundary handoffs; drives `t_first_us` and `bubble_time_us`. (Raw on purpose — see overlap semantics above.) |
+| `pipeline_comm_overlap_factor` | **(Step 8b)** The `pipeline_comm_overlap_factor` actually applied (clamped to `[0,1]`). Distinct from the `overlap_factor` parameter, which controls within-stage compute/comm overlap and shapes `t_stage_us`; this column controls inter-stage handoff/compute overlap and shapes `t_step_us` only. |
 
 Details and column descriptions of the other CSVs are in [ANALYTICAL_LATENCY_CALCULATOR_CLI.md](ANALYTICAL_LATENCY_CALCULATOR_CLI.md) (Output directory and files, and the following sections).
 

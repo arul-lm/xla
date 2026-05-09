@@ -97,6 +97,19 @@ int analytical_latency_calculator_run(
    pipeline_microbatches: number of microbatches per pipeline step. 0 means
        only per-microbatch steady-state metrics are reported (T_total_us is
        left at 0 in pipeline_stats.csv).
+   pipeline_comm_overlap_factor: inter-stage compute/handoff overlap factor
+       in [0.0, 1.0]. 0.0 = no overlap (conservative; T_step backs up to the
+       full slowest handoff). 0.5 = typical 1F1B-style overlap with the next
+       stage's compute. 1.0 = handoff fully hidden in cadence. Out-of-range
+       values are clamped. Only the steady-state cadence (T_step) benefits
+       from this; T_first / bubble / per-microbatch traversal cost use the
+       raw handoff because microbatch 0 cannot hide its own handoffs.
+
+   The handoff cost is computed PER BOUNDARY: for each k in [0, S-2] the
+   calculator walks the Calcium fabric path between rank-0 of stage k and
+   rank-0 of stage k+1, takes the bottleneck EffectiveBandwidth (sharing=1),
+   adds 1-us-per-hop latency, and aggregates max/sum into pipeline_stats.csv
+   columns t_handoff_max_us / t_handoff_sum_us / t_handoff_us (avg).
 
    ARCH RESTRICTION
    ----------------
@@ -108,9 +121,10 @@ int analytical_latency_calculator_run(
 
    ABI STABILITY
    -------------
-   This function is added alongside the existing analytical_latency_calculator_run
-   without altering its signature. Pre-built downstream binaries that link
-   against analytical_latency_calculator_run continue to work unchanged.
+   The signature gained pipeline_comm_overlap_factor; pre-existing callers
+   need to recompile. The legacy analytical_latency_calculator_run() symbol
+   above is unchanged and forwards here with pipeline_comm_overlap_factor=0.0,
+   so callers that only use _run continue to work unmodified.
 
    When num_pipeline_stages <= 1, this function delegates to the same
    underlying core logic as analytical_latency_calculator_run() - the legacy
@@ -130,6 +144,7 @@ int analytical_latency_calculator_run_with_pipeline(
     int num_pipeline_stages,
     int64_t pipeline_activation_bytes,
     int pipeline_microbatches,
+    double pipeline_comm_overlap_factor,
     char* error_buffer,
     size_t error_buffer_size);
 

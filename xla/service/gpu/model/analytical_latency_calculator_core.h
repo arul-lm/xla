@@ -52,6 +52,13 @@ struct AnalyticalLatencyCalculatorOpts {
   int     num_pipeline_stages = 1;          // 1 = no PP modeling
   int64_t pipeline_activation_bytes = 0;    // 0 = auto-infer from HLO
   int     pipeline_microbatches = 0;        // 0 = per-microbatch only
+
+  // Inter-stage compute/handoff overlap factor in [0.0, 1.0]. When > 0, the
+  // visible per-boundary handoff cost is multiplied by (1 - factor); see
+  // CalciumClusterConfig::CalculatePipelineHandoffCosts. 0.0 (the default)
+  // is the conservative no-overlap behavior - byte-identical to pre-Step-8b
+  // PP outputs.
+  double  pipeline_comm_overlap_factor = 0.0;
 };
 
 // Runs the analytical latency calculation: loads the HLO module, runs

@@ -1188,7 +1188,8 @@ CalciumClusterConfig::CalciumClusterConfig()
       servers_per_rack_(7),
       intranode_efficiency_factor_(0.95),
       internode_efficiency_factor_(0.85),
-      device_id_layout_("row_major_socs_first") {}
+      device_id_layout_("row_major_socs_first"),
+      hierarchical_allreduce_enabled_(false) {}
 
 std::string CalciumClusterConfig::GetNamePattern() const { return name_pattern_; }
 
@@ -1257,6 +1258,12 @@ bool CalciumClusterConfig::LoadFromFile(const std::string &config_file_path) {
       pods_per_rack_ = std::stoi(value);
     } else if (key == "servers_per_rack") {
       servers_per_rack_ = std::stoi(value);
+    } else if (key == "hierarchical_allreduce_enabled") {
+      // Accept "1"/"0"/"true"/"false" (case-insensitive).
+      std::string v = value;
+      std::transform(v.begin(), v.end(), v.begin(),
+                     [](unsigned char ch) { return std::tolower(ch); });
+      hierarchical_allreduce_enabled_ = (v == "1" || v == "true" || v == "yes");
     }
   }
 
@@ -1598,10 +1605,273 @@ CommType CalciumClusterConfig::DetermineCommTypeFromPath(
   return CommType::ScaleUp;
 }
 
+// =====================================================================
+// Step 9: hierarchical AllReduce helpers.
+//
+// All four are no-ops when hierarchical_allreduce_enabled_ is false; that
+// is enforced by the caller (CalculateCommCost). The helpers themselves
+// don't read the flag - they're pure cost functions, so they can be called
+// from tests/smokes regardless.
+// =====================================================================
+
+namespace {
+
+// Identifies "leaf" hops: per-SoC dedicated egress edges. These are NOT
+// shared across simultaneous parallel rails - each rail uses a different
+// SoC's port - so the parallel_rails multiplier MUST NOT inflate sharing
+// here. Other links (L1<->L2, L2<->L3, L3<->NIC, NIC<->ToR, etc.) are
+// shared by multiple SoCs in their fan-in subtree and DO see parallel_rails
+// contention.
+bool IsLeafHopForRails(PathComponent a, PathComponent b) {
+  auto eq = [](PathComponent x, PathComponent y, PathComponent u,
+               PathComponent v) { return (x == u && y == v) ||
+                                         (x == v && y == u); };
+  // q250: SoC <-> L1Switch is the leaf.
+  if (eq(a, b, PathComponent::GPU, PathComponent::L1Switch)) return true;
+  // q250l200: SoC <-> SoC interposer (intra-pod), SoC <-> OpticalSwitch
+  // (cross-pod intra-rack), SoC <-> NIC (cross-rack). All three are
+  // per-SoC dedicated optical / NIC ports.
+  if (eq(a, b, PathComponent::GPU, PathComponent::GPU)) return true;
+  if (eq(a, b, PathComponent::GPU, PathComponent::OpticalSwitch)) return true;
+  if (eq(a, b, PathComponent::GPU, PathComponent::NIC)) return true;
+  return false;
+}
+
+}  // namespace
+
+std::vector<std::vector<int64_t>>
+CalciumClusterConfig::PartitionAtTier(
+    const std::vector<int64_t>& device_ids, Tier tier) const {
+  // Map each device id to its tier-key, preserving id order within a key
+  // so the first-encountered id of a subgroup remains its representative.
+  std::unordered_map<int64_t, std::vector<int64_t>> by_key;
+  std::vector<int64_t> key_order;
+  by_key.reserve(device_ids.size());
+  for (int64_t id : device_ids) {
+    CalciumCoord c = DecodeId(id);
+    int64_t key = 0;
+    switch (tier) {
+      case Tier::Pod:
+        // (rack, server, card, l1_pod)
+        key = (((static_cast<int64_t>(c.rack) * servers_per_rack_) + c.server)
+                  * cards_per_server_ + c.card) * l1_pods_per_card_ + c.l1_pod;
+        break;
+      case Tier::Card:
+        // (rack, server, card)
+        key = ((static_cast<int64_t>(c.rack) * servers_per_rack_) + c.server)
+                  * cards_per_server_ + c.card;
+        break;
+      case Tier::Server:
+        // (rack, server)
+        key = static_cast<int64_t>(c.rack) * servers_per_rack_ + c.server;
+        break;
+      case Tier::Rack:
+        key = c.rack;
+        break;
+    }
+    auto it = by_key.find(key);
+    if (it == by_key.end()) {
+      by_key.emplace(key, std::vector<int64_t>{id});
+      key_order.push_back(key);
+    } else {
+      it->second.push_back(id);
+    }
+  }
+  std::vector<std::vector<int64_t>> out;
+  out.reserve(key_order.size());
+  for (int64_t k : key_order) out.push_back(std::move(by_key[k]));
+  return out;
+}
+
+std::vector<CalciumClusterConfig::Tier>
+CalciumClusterConfig::AutoSelectTiers(
+    const std::vector<int64_t>& device_ids) const {
+  if (device_ids.size() <= 1) return {};
+  bool multi_pod = false;
+  bool multi_card = false;
+  bool multi_server = false;
+  bool multi_rack = false;
+  CalciumCoord first = DecodeId(device_ids.front());
+  for (int64_t id : device_ids) {
+    CalciumCoord c = DecodeId(id);
+    if (c.rack != first.rack) multi_rack = true;
+    if (c.rack != first.rack || c.server != first.server) multi_server = true;
+    if (c.rack != first.rack || c.server != first.server ||
+        c.card != first.card) multi_card = true;
+    if (c.rack != first.rack || c.server != first.server ||
+        c.card != first.card || c.l1_pod != first.l1_pod) multi_pod = true;
+  }
+  // Whole group fits in a single pod -> nothing to gain from decomposition;
+  // flat AR is already correct (single fast tier).
+  if (!multi_pod) return {};
+
+  // q250l200 hybrid optical: pod boundary is the only fast/slow split
+  // worth exploiting on intra-rack groups; multi-rack adds the L4 NIC tier.
+  if (is_l200_) {
+    if (multi_rack) return {Tier::Pod, Tier::Rack};
+    return {Tier::Pod};
+  }
+  // q250 4-level PCIe + L4 RoCE.
+  if (multi_server) return {Tier::Pod, Tier::Card, Tier::Server};
+  if (multi_card) return {Tier::Pod, Tier::Card};
+  return {Tier::Pod};
+}
+
+double CalciumClusterConfig::SubgroupRsAgCostUs(
+    const std::vector<int64_t>& subgroup, double per_device_bytes,
+    int parallel_rails) const {
+  if (subgroup.size() <= 1 || per_device_bytes <= 0.0) return 0.0;
+  if (parallel_rails < 1) parallel_rails = 1;
+
+  // Worst-pair path inside the subgroup. For a homogeneous Calcium tier
+  // (pod/card/server/rack) all pairs share the same path topology, so any
+  // pair would do; we still iterate to match flat-AR worst-pair semantics
+  // and to be robust against degenerate subgroups.
+  double max_us = 0.0;
+  for (size_t i = 0; i < subgroup.size(); ++i) {
+    const int64_t src = subgroup[i];
+    const int64_t dst = subgroup[(i + 1) % subgroup.size()];
+    std::vector<PathComponent> path = PathBetweenDevices(src, dst);
+    if (path.size() < 2) continue;
+
+    double bottleneck_gbps = std::numeric_limits<double>::infinity();
+    for (size_t h = 0; h + 1 < path.size(); ++h) {
+      const int natural =
+          ComputeDevicesSharingHop(path[h], path[h + 1], subgroup);
+      // Only inflate sharing on shared upstream hops. Leaf hops are per-SoC
+      // dedicated and parallel rails use different SoC ports - sharing on
+      // that hop is always 1 regardless of parallel_rails.
+      const int effective =
+          IsLeafHopForRails(path[h], path[h + 1])
+              ? natural
+              : natural * parallel_rails;
+      const double bw = EffectiveBandwidth(path[h], path[h + 1], effective);
+      if (bw < bottleneck_gbps) bottleneck_gbps = bw;
+    }
+    if (!std::isfinite(bottleneck_gbps) || bottleneck_gbps <= 0.0) continue;
+
+    const int hop_count = static_cast<int>(path.size() - 1);
+    const double bytes_us =
+        (per_device_bytes / (1024.0 * 1024.0 * 1024.0)) /
+        bottleneck_gbps * 1e6;
+    const double t_us = bytes_us + hop_count * 1.0;  // 1 us / hop
+    if (t_us > max_us) max_us = t_us;
+  }
+  return max_us;
+}
+
+double CalciumClusterConfig::FlatAllReduceCostUs(
+    const std::vector<int64_t>& device_ids, double per_device_bytes,
+    int parallel_rails) const {
+  // Identical structure to the legacy CalculateCommCost worst-pair loop,
+  // factored out so the recursion's base case can reuse it. Top-level
+  // callers pass parallel_rails=1, which is byte-stable vs. the legacy
+  // path. We charge the FULL per-device AR volume at the worst-pair
+  // bottleneck (this matches the legacy semantics; the volume itself
+  // already encodes 2*(N-1)/N from the caller).
+  if (device_ids.size() <= 1 || per_device_bytes <= 0.0) return 0.0;
+  if (parallel_rails < 1) parallel_rails = 1;
+
+  double max_us = 0.0;
+  for (size_t i = 0; i < device_ids.size(); ++i) {
+    const int64_t src = device_ids[i];
+    const int64_t dst = device_ids[(i + 1) % device_ids.size()];
+    std::vector<PathComponent> path = PathBetweenDevices(src, dst);
+    if (path.size() < 2) continue;
+
+    double bottleneck_gbps = std::numeric_limits<double>::infinity();
+    for (size_t h = 0; h + 1 < path.size(); ++h) {
+      const int natural =
+          ComputeDevicesSharingHop(path[h], path[h + 1], device_ids);
+      const int effective =
+          IsLeafHopForRails(path[h], path[h + 1])
+              ? natural
+              : natural * parallel_rails;
+      const double bw = EffectiveBandwidth(path[h], path[h + 1], effective);
+      if (bw < bottleneck_gbps) bottleneck_gbps = bw;
+    }
+    if (!std::isfinite(bottleneck_gbps) || bottleneck_gbps <= 0.0) continue;
+
+    const int hop_count = static_cast<int>(path.size() - 1);
+    const double bytes_us =
+        (per_device_bytes / (1024.0 * 1024.0 * 1024.0)) /
+        bottleneck_gbps * 1e6;
+    const double t_us = bytes_us + hop_count * 1.0;
+    if (t_us > max_us) max_us = t_us;
+  }
+  return max_us;
+}
+
+double CalciumClusterConfig::HierarchicalAllReduceCostUs(
+    const std::vector<int64_t>& device_ids, double tensor_bytes,
+    const std::vector<Tier>& tiers, int parallel_rails) const {
+  // NB: this function takes the TENSOR size T (not the per-device AR
+  // volume V = 2(N-1)/N * T). The plan's stage-volume formulas all
+  // reference T directly, and the recursive cross-subgroup AR runs on
+  // the (T/k)-shard tensor. The single conversion happens at the top-
+  // level call site in CalculateCommCost.
+  if (device_ids.size() <= 1 || tensor_bytes <= 0.0) return 0.0;
+  if (parallel_rails < 1) parallel_rails = 1;
+
+  // Base case: flat AR over the (now-homogeneous) group on the current
+  // tensor. Convert tensor -> per-device AR volume (2(N-1)/N * T) so
+  // FlatAllReduceCostUs can charge it like a normal flat AR.
+  if (tiers.empty()) {
+    const double N = static_cast<double>(device_ids.size());
+    const double per_dev_vol = 2.0 * (N - 1.0) / N * tensor_bytes;
+    return FlatAllReduceCostUs(device_ids, per_dev_vol, parallel_rails);
+  }
+
+  std::vector<std::vector<int64_t>> subgroups =
+      PartitionAtTier(device_ids, tiers.front());
+  std::vector<Tier> rest(tiers.begin() + 1, tiers.end());
+
+  // Whole group fits in one subgroup at this tier: descend without paying
+  // the decomposition.
+  if (subgroups.size() <= 1) {
+    return HierarchicalAllReduceCostUs(device_ids, tensor_bytes, rest,
+                                       parallel_rails);
+  }
+
+  // Stage 1 - intra-subgroup ReduceScatter. All subgroups run in parallel;
+  // the cost is the slowest subgroup (worst-pair-style charging).
+  // Per-SoC RS volume = T * (k-1)/k where k = subgroup size.
+  double t_rs = 0.0;
+  for (const auto& sg : subgroups) {
+    if (sg.size() <= 1) continue;
+    const double k = static_cast<double>(sg.size());
+    const double rs_vol = tensor_bytes * (k - 1.0) / k;
+    t_rs = std::max(t_rs, SubgroupRsAgCostUs(sg, rs_vol, parallel_rails));
+  }
+
+  // Stage 2 - cross-subgroup AR on the (T/k)-shard. Use the SMALLEST
+  // subgroup size as `k` (most pessimistic shard size for unequal
+  // subgroups; equals the common k for equal subgroups). The recursive
+  // call gets parallel_rails *= k because the outer subgroup runs k
+  // simultaneous shard-rails over the up-tier links.
+  int k_min = static_cast<int>(subgroups.front().size());
+  for (const auto& sg : subgroups) {
+    int s = static_cast<int>(sg.size());
+    if (s > 0 && s < k_min) k_min = s;
+  }
+  if (k_min < 1) k_min = 1;
+  std::vector<int64_t> reps;
+  reps.reserve(subgroups.size());
+  for (const auto& sg : subgroups) reps.push_back(sg.front());
+  const double t_cross = HierarchicalAllReduceCostUs(
+      reps, tensor_bytes / static_cast<double>(k_min), rest,
+      parallel_rails * k_min);
+
+  // Stage 3 - intra-subgroup AllGather. Symmetric to Stage 1.
+  const double t_ag = t_rs;
+
+  return t_rs + t_cross + t_ag;
+}
+
 CommCostStats CalciumClusterConfig::CalculateCommCost(
     double per_device_comm_volume,
     const stream_executor::DeviceDescription & /*device_info*/,
-    const xla::HloInstruction * /*instr*/, uint64_t replica_group_size,
+    const xla::HloInstruction *instr, uint64_t replica_group_size,
     uint64_t /*num_replica_groups*/, const std::vector<int64_t> &device_ids,
     const std::vector<int> & /*mesh_shape*/,
     const std::string & /*hardware_architecture*/,
@@ -1660,6 +1930,47 @@ CommCostStats CalciumClusterConfig::CalculateCommCost(
 
   if (!longest_path.empty()) {
     comm_type = DetermineCommTypeFromPath(longest_path);
+  }
+
+  // Step 9: hierarchical AllReduce. Replaces `max_comm_cost_us` only when
+  //   (a) the per-config flag `hierarchical_allreduce_enabled=1` is set, AND
+  //   (b) the opcode is kAllReduce / kAllReduceStart, AND
+  //   (c) AutoSelectTiers picks at least one tier (i.e. the replica group
+  //       actually crosses a tier boundary - single-pod groups stay flat).
+  // Every other code path (other opcodes, other arches, flag off) is
+  // byte-stable. `comm_type` and `max_hops` are still derived from the flat
+  // worst-pair `longest_path` to preserve CSV classification semantics
+  // (plan §4.6).
+  if (hierarchical_allreduce_enabled_ && instr != nullptr &&
+      (instr->opcode() == xla::HloOpcode::kAllReduce ||
+       instr->opcode() == xla::HloOpcode::kAllReduceStart)) {
+    std::vector<Tier> tiers = AutoSelectTiers(device_ids);
+    if (!tiers.empty()) {
+      // Recover tensor bytes T from the per-device AR volume V:
+      //   V = 2(N-1)/N * T   =>   T = V * N / (2(N-1))
+      // The hierarchical recursion expresses stage volumes in T directly;
+      // see HierarchicalAllReduceCostUs for the rationale.
+      const double N = static_cast<double>(device_ids.size());
+      const double tensor_bytes =
+          (N > 1.0)
+              ? per_device_comm_volume * N / (2.0 * (N - 1.0))
+              : per_device_comm_volume;
+      const double hier_us = HierarchicalAllReduceCostUs(
+          device_ids, tensor_bytes, tiers, /*parallel_rails=*/1);
+      // Monotonicity invariant (plan §5.3 #2): hierarchical schedule must
+      // never cost more than the flat worst-pair schedule for the same
+      // group/volume. If it ever does we have a modeling bug; clamp and
+      // warn rather than crash so production callers don't suddenly fail.
+      if (hier_us > max_comm_cost_us + 1e-6 && max_comm_cost_us > 0.0) {
+        LOG(WARNING) << "CalciumClusterConfig: hierarchical AR ("
+                     << hier_us << " us) > flat AR (" << max_comm_cost_us
+                     << " us); falling back to flat. group_size="
+                     << device_ids.size()
+                     << " per_device_volume=" << per_device_comm_volume;
+      } else if (hier_us > 0.0) {
+        max_comm_cost_us = hier_us;
+      }
+    }
   }
 
   // Apply efficiency factor based on intra/inter-node classification.

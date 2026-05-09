@@ -327,6 +327,14 @@ struct CalciumCoord {
 // for the non-CUDA Calcium accelerator (q250). Models intra-pod, intra-card,
 // intra-server, and inter-server collective costs with explicit
 // oversubscription and replica-group contention sharing.
+//
+// Step 9 adds an optional hierarchical AllReduce cost model gated by
+// `hierarchical_allreduce_enabled` in the .config file (default off). When
+// enabled it short-circuits the flat worst-pair AR loop with a recursive
+// {Pod, Card, Server, Rack} decomposition that charges intra-tier volume at
+// the local tier's bandwidth and only the T/k cross-tier shard at the slow
+// tier. Every other opcode and every other arch (B200/R200/R576/TPU) is
+// untouched.
 class CalciumClusterConfig : public ClusterConfig {
 private:
     std::string name_pattern_;
@@ -368,9 +376,22 @@ private:
     // Device-id layout convention. Only "row_major_socs_first" supported today.
     std::string device_id_layout_;
 
+    // Step 9: hierarchical AllReduce gating. Default off keeps the flat
+    // worst-pair AR cost path byte-stable. Enabled per-config via the
+    // `hierarchical_allreduce_enabled=1` key in q250.config / q250l200.config
+    // (both gitignored / local-only). Affects only kAllReduce / kAllReduceStart
+    // opcodes; every other collective (AllGather, ReduceScatter, etc.) keeps
+    // the existing flat cost model regardless of this flag.
+    bool hierarchical_allreduce_enabled_;
+
 public:
     CalciumClusterConfig();
     virtual ~CalciumClusterConfig() = default;
+
+    // Internal tier used by the hierarchical AllReduce decomposition.
+    // Public so unit tests / smokes can drive the helpers directly without
+    // friend declarations.
+    enum class Tier { Pod, Card, Server, Rack };
 
     // ClusterConfig interface implementation.
     std::string GetNamePattern() const override;
@@ -463,6 +484,74 @@ public:
     // Diagnostic getters.
     double GetIntranodeEfficiencyFactor() const { return intranode_efficiency_factor_; }
     double GetInternodeEfficiencyFactor() const { return internode_efficiency_factor_; }
+    bool   GetHierarchicalAllReduceEnabled() const {
+        return hierarchical_allreduce_enabled_;
+    }
+
+    // ----- Step 9: hierarchical AllReduce helpers -----
+    //
+    // These are only consulted when hierarchical_allreduce_enabled_ is true
+    // AND the opcode is kAllReduce / kAllReduceStart. They are public solely
+    // for testability; production callers should go through CalculateCommCost.
+
+    // Partition `device_ids` at the given tier. Two ids land in the same
+    // subgroup iff they share the tier-defining coordinates (Pod groups by
+    // (rack, server, card, l1_pod), Card by (rack, server, card), Server by
+    // (rack, server), Rack by (rack)).
+    std::vector<std::vector<int64_t>> PartitionAtTier(
+        const std::vector<int64_t>& device_ids, Tier tier) const;
+
+    // Auto-pick the tier list for a replica group based on the span of the
+    // decoded coordinates. Returns the smallest tier list that captures the
+    // actual cross-tier structure of `device_ids`. Returns {} when the whole
+    // group fits in a single pod (no decomposition is profitable).
+    std::vector<Tier> AutoSelectTiers(
+        const std::vector<int64_t>& device_ids) const;
+
+    // Single-stage RS or AG cost (microseconds) on a homogeneous subgroup.
+    // Uses worst-pair semantics inside the subgroup (matching flat AR's
+    // per-stage charging convention).
+    //
+    // `parallel_rails` is the cumulative product of enclosing-stage subgroup
+    // sizes (1 at the top-level call). It inflates the participant count on
+    // shared upstream hops to model the physical fact that all `parallel_rails`
+    // outer-group peers send simultaneously over each shared upstream link.
+    // The leaf hop (SoC<->L1, SoC<->SoC interposer, SoC<->OpticalSwitch,
+    // SoC<->NIC) is unaffected because it is a per-SoC dedicated egress, not
+    // a shared link.
+    double SubgroupRsAgCostUs(const std::vector<int64_t>& subgroup,
+                              double per_device_bytes,
+                              int parallel_rails) const;
+
+    // Flat AllReduce cost (microseconds) over `device_ids`, with the same
+    // worst-pair logic the legacy CalculateCommCost loop uses, but
+    // additionally inflated by `parallel_rails` on shared upstream hops.
+    // Top-level callers pass parallel_rails=1, which preserves byte-stable
+    // flat-AR output.
+    double FlatAllReduceCostUs(const std::vector<int64_t>& device_ids,
+                               double per_device_bytes,
+                               int parallel_rails) const;
+
+    // Recursive hierarchical AllReduce cost (microseconds) over `device_ids`,
+    // partitioning at `tiers[0]` first and recursing on the subgroup
+    // representatives with the (T/k)-shard tensor. Falls back to
+    // FlatAllReduceCostUs when `tiers` is empty (base case) or when the
+    // current tier yields a single subgroup (no decomposition possible at
+    // this tier; descend).
+    //
+    // NOTE: takes the TENSOR size T (not the per-device AR volume
+    // 2(N-1)/N * T). The single conversion happens at the top-level call
+    // site in CalculateCommCost so the plan's stage-volume formulas
+    // (T*(k-1)/k for RS/AG, T/k for the recursive cross-subgroup AR) can be
+    // expressed directly.
+    //
+    // Returns the sum of stage costs (RS_intra + AR_inter + AG_intra). The
+    // caller is responsible for applying the outer efficiency factor.
+    double HierarchicalAllReduceCostUs(
+        const std::vector<int64_t>& device_ids,
+        double tensor_bytes,
+        const std::vector<Tier>& tiers,
+        int parallel_rails) const;
 };
 
 // Factory function to create cluster config based on device type

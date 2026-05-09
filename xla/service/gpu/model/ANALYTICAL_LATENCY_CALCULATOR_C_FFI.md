@@ -12,10 +12,10 @@ Two C entry points are exported:
 
 | Function | Use it when |
 |----------|-------------|
-| **`analytical_latency_calculator_run`** | You want the legacy behavior (no pipeline parallelism). All architectures are supported and assume `PP=1`. **ABI-stable**: signature has not changed since this function was introduced. Forwards internally to `analytical_latency_calculator_run_with_pipeline` with `num_pipeline_stages = 1` and `pipeline_comm_overlap_factor = 0.0`. |
-| **`analytical_latency_calculator_run_with_pipeline`** | You want pipeline-parallelism modeling for the Calcium (`q250`) architecture, with bubble accounting and a `pipeline_stats.csv` output. Includes a `pipeline_comm_overlap_factor` knob in `[0.0, 1.0]` for inter-stage compute/handoff overlap (`0.0` = no overlap, byte-stable with pre-Step-8b runs). Setting `num_pipeline_stages <= 1` makes this function byte-identical to `analytical_latency_calculator_run`. |
+| **`analytical_latency_calculator_run`** | You want the legacy behavior (no pipeline parallelism, flat worst-pair AR). All architectures are supported and assume `PP=1`. **ABI-stable**: signature has not changed since this function was introduced. Forwards internally to `analytical_latency_calculator_run_with_pipeline` with `num_pipeline_stages = 1`, `pipeline_comm_overlap_factor = 0.0`, and `hierarchical_allreduce_enabled = -1` (leave the cost model at its OFF default — flat worst-pair AR). |
+| **`analytical_latency_calculator_run_with_pipeline`** | You want pipeline-parallelism modeling for the Calcium (`q250`) architecture, with bubble accounting and a `pipeline_stats.csv` output. Includes a `pipeline_comm_overlap_factor` knob in `[0.0, 1.0]` for inter-stage compute/handoff overlap and a tri-state `hierarchical_allreduce_enabled` knob (`-1`/`0`/`1`) — the **only** way to enable the Step 9 hierarchical AllReduce cost model (no config-file key exists). Setting `num_pipeline_stages <= 1` and `hierarchical_allreduce_enabled <= 0` makes this function byte-identical to `analytical_latency_calculator_run`. |
 
-Both symbols are exported from the FFI shared libraries (verify with `nm -D libanalytical_latency_ffi.so | grep analytical_latency`). The `_with_pipeline` signature gained `pipeline_comm_overlap_factor` in Step 8b — pre-existing callers of that symbol must recompile against the new header. The legacy `_run` symbol is unchanged.
+Both symbols are exported from the FFI shared libraries (verify with `nm -D libanalytical_latency_ffi.so | grep analytical_latency`). The `_with_pipeline` signature gained `pipeline_comm_overlap_factor` in Step 8b and `hierarchical_allreduce_enabled` in Step 9 — pre-existing callers of that symbol must recompile against the new header. The legacy `_run` symbol is unchanged.
 
 ---
 
@@ -66,15 +66,16 @@ int analytical_latency_calculator_run_with_pipeline(
     int fix_ragged_dot_flops,
     int dump_modified_module,
     double scale_memory_bandwidth,
-    int     num_pipeline_stages,           /* 0 or 1 = no PP modeling */
-    int64_t pipeline_activation_bytes,     /* 0 = auto-infer from HLO */
-    int     pipeline_microbatches,         /* 0 = per-microbatch only */
-    double  pipeline_comm_overlap_factor,  /* 0.0-1.0, 0.0 = no overlap */
+    int     num_pipeline_stages,            /* 0 or 1 = no PP modeling */
+    int64_t pipeline_activation_bytes,      /* 0 = auto-infer from HLO */
+    int     pipeline_microbatches,          /* 0 = per-microbatch only */
+    double  pipeline_comm_overlap_factor,   /* 0.0-1.0, 0.0 = no overlap */
+    int     hierarchical_allreduce_enabled, /* -1 = use .config; 0/1 force */
     char* error_buffer,
     size_t error_buffer_size);
 ```
 
-The first nine parameters and the trailing `error_buffer` / `error_buffer_size` are identical to the legacy entry point. The four middle parameters control pipeline-parallelism modeling. `pipeline_comm_overlap_factor` was added in Step 8b — pre-existing callers must recompile against the new header. Setting `num_pipeline_stages <= 1` (and any value for the others) makes this function byte-identical to `analytical_latency_calculator_run`.
+The first nine parameters and the trailing `error_buffer` / `error_buffer_size` are identical to the legacy entry point. The four PP parameters control pipeline-parallelism modeling. `hierarchical_allreduce_enabled` is the tri-state per-call selector for the Step 9 Calcium hierarchical AllReduce cost model — `-1` (or `0`) leaves the model OFF (flat worst-pair AR; byte-stable), `1` enables the hierarchical decomposition. There is no `.config` file key for this flag — the FFI parameter (or its `--hierarchical-allreduce-enabled` CLI counterpart) is the **only** way to turn the model on. The flag is silently ignored on non-Calcium archs. The `_with_pipeline` signature has gained two parameters since introduction: `pipeline_comm_overlap_factor` (Step 8b) and `hierarchical_allreduce_enabled` (Step 9); pre-existing callers must recompile against the new header. Setting `num_pipeline_stages <= 1` and `hierarchical_allreduce_enabled <= 0` (and any value for the others) makes this function byte-identical to `analytical_latency_calculator_run`.
 
 ---
 
@@ -104,6 +105,7 @@ The first nine parameters and the trailing `error_buffer` / `error_buffer_size` 
 | **pipeline_activation_bytes** | `int64_t` | Yes (use `0` for default) | Byte size of the activation handed off between consecutive pipeline stages. **`0`** auto-infers from the HLO entry-computation parameter shapes (sum of `xla::ShapeUtil::ByteSizeOf` over all parameters). For training (forward + backward) pass `2 * forward_size` explicitly. |
 | **pipeline_microbatches** | `int` | Yes (use `0` for default) | Number of microbatches per pipeline step. **`0`** reports per-microbatch metrics only (`t_total_us = 0` in `pipeline_stats.csv`); **`> 0`** computes the full pipeline runtime including bubble fraction. |
 | **pipeline_comm_overlap_factor** | `double` | Yes (use `0.0` for default) | Inter-stage compute/handoff overlap factor in `[0.0, 1.0]`. The visible per-boundary handoff cost is multiplied by `(1 - factor)`. `0.0` = no overlap, conservative (and byte-stable with pre-Step-8b runs). `0.5` ≈ typical 1F1B-style overlap with the next stage's compute. `1.0` = handoff fully hidden in cadence. Out-of-range values are clamped. |
+| **hierarchical_allreduce_enabled** | `int` | Yes (use `-1` for default) | **Tri-state** selector for the **Step 9** Calcium hierarchical AllReduce cost model. **`-1`** = leave at the built-in default (OFF; flat worst-pair AR; byte-stable). **`0`** = explicit OFF (flat worst-pair AR). **`1`** = ON (hierarchical `{Pod, Card, Server}` or `{Pod, Rack}` decomposition; see [`cebuq/HIERARCHICAL_ALLREDUCE_PLAN.md`](../../../cebuq/HIERARCHICAL_ALLREDUCE_PLAN.md)). **Calcium-only**: silently ignored on non-Calcium archs. **No `.config` key exists** for this flag — the FFI parameter is the only way to turn the model on. Any value other than `-1`, `0`, `1` is treated as `-1`. |
 
 The HLO module passed to `_with_pipeline` is interpreted as **one pipeline stage**. The calculator multiplies by `num_pipeline_stages` and computes a **per-boundary** handoff cost via `CalciumClusterConfig::CalculatePipelineHandoffCosts`: for each `k ∈ [0, S-2]` it walks `PathBetweenDevices(k * devices_per_stage, (k+1) * devices_per_stage)`, takes the bottleneck `EffectiveBandwidth(...)` with `sharing=1`, applies the `internode_efficiency_factor`, adds 1-µs-per-hop latency, and exposes two views:
 

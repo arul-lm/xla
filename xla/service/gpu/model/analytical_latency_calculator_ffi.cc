@@ -64,6 +64,7 @@ int analytical_latency_calculator_run_with_pipeline(
     int64_t pipeline_activation_bytes,
     int pipeline_microbatches,
     double pipeline_comm_overlap_factor,
+    int hierarchical_allreduce_enabled,
     char* error_buffer,
     size_t error_buffer_size) {
   if (hlo_module_file == nullptr || std::strlen(hlo_module_file) == 0) {
@@ -111,6 +112,16 @@ int analytical_latency_calculator_run_with_pipeline(
       (pipeline_microbatches > 0) ? pipeline_microbatches : 0;
   // Step 8b: comm overlap factor. Clamped to [0,1] inside the cluster config.
   opts.pipeline_comm_overlap_factor = pipeline_comm_overlap_factor;
+  // Step 9: hierarchical AllReduce selector. -1 leaves the model at its
+  // built-in OFF default (flat worst-pair AR; byte-stable); 0/1 explicitly
+  // turn it off/on. Any out-of-range value is normalized to -1 so the
+  // built-in default wins (defensive). There is intentionally no .config
+  // file key for this flag.
+  opts.hierarchical_allreduce_enabled =
+      (hierarchical_allreduce_enabled == 0 ||
+       hierarchical_allreduce_enabled == 1)
+          ? hierarchical_allreduce_enabled
+          : -1;
 
   std::string output_prefix_str;  // empty: output_dir is absolute or relative to cwd
 
@@ -217,6 +228,9 @@ int analytical_latency_calculator_run(
       /*pipeline_activation_bytes=*/0,
       /*pipeline_microbatches=*/0,
       /*pipeline_comm_overlap_factor=*/0.0,
+      // Sentinel -1: use the value from q250.config / q250l200.config so
+      // _run callers see the same AR cost model the .config picks (Step 9).
+      /*hierarchical_allreduce_enabled=*/-1,
       error_buffer, error_buffer_size);
 }
 

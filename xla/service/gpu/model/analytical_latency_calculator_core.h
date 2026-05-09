@@ -59,6 +59,15 @@ struct AnalyticalLatencyCalculatorOpts {
   // is the conservative no-overlap behavior - byte-identical to pre-Step-8b
   // PP outputs.
   double  pipeline_comm_overlap_factor = 0.0;
+
+  // Tri-state selector for the Calcium hierarchical AllReduce cost model
+  // (Step 9). Calcium-only; ignored for every other arch.
+  //   -1 = leave at default (OFF; byte-stable flat worst-pair AR)
+  //    0 = explicit OFF (flat worst-pair AR)
+  //    1 = ON  (hierarchical AR; ~1.5x-180x speedup depending on RG)
+  // There is intentionally no config-file key for this flag - selecting
+  // the cost model is the FFI / CLI caller's responsibility.
+  int     hierarchical_allreduce_enabled = -1;
 };
 
 // Runs the analytical latency calculation: loads the HLO module, runs

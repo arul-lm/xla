@@ -328,13 +328,14 @@ struct CalciumCoord {
 // intra-server, and inter-server collective costs with explicit
 // oversubscription and replica-group contention sharing.
 //
-// Step 9 adds an optional hierarchical AllReduce cost model gated by
-// `hierarchical_allreduce_enabled` in the .config file (default off). When
-// enabled it short-circuits the flat worst-pair AR loop with a recursive
-// {Pod, Card, Server, Rack} decomposition that charges intra-tier volume at
-// the local tier's bandwidth and only the T/k cross-tier shard at the slow
-// tier. Every other opcode and every other arch (B200/R200/R576/TPU) is
-// untouched.
+// Step 9 adds an optional hierarchical AllReduce cost model toggled
+// per-call via SetHierarchicalAllReduceEnabled (driven by the FFI / CLI
+// `hierarchical_allreduce_enabled` parameter, default OFF). When ON it
+// short-circuits the flat worst-pair AR loop with a recursive
+// {Pod, Card, Server, Rack} decomposition that charges intra-tier volume
+// at the local tier's bandwidth and only the T/k cross-tier shard at the
+// slow tier. Every other opcode and every other arch (B200/R200/R576/TPU)
+// is untouched.
 class CalciumClusterConfig : public ClusterConfig {
 private:
     std::string name_pattern_;
@@ -377,11 +378,14 @@ private:
     std::string device_id_layout_;
 
     // Step 9: hierarchical AllReduce gating. Default off keeps the flat
-    // worst-pair AR cost path byte-stable. Enabled per-config via the
-    // `hierarchical_allreduce_enabled=1` key in q250.config / q250l200.config
-    // (both gitignored / local-only). Affects only kAllReduce / kAllReduceStart
-    // opcodes; every other collective (AllGather, ReduceScatter, etc.) keeps
-    // the existing flat cost model regardless of this flag.
+    // worst-pair AR cost path byte-stable. Toggled exclusively by callers
+    // via SetHierarchicalAllReduceEnabled() (used by the FFI parameter
+    // `hierarchical_allreduce_enabled` on
+    // analytical_latency_calculator_run_with_pipeline and the matching
+    // `--hierarchical-allreduce-enabled` CLI flag). Intentionally NOT a
+    // config-file key. Affects only kAllReduce / kAllReduceStart opcodes;
+    // every other collective (AllGather, ReduceScatter, etc.) keeps the
+    // existing flat cost model regardless of this flag.
     bool hierarchical_allreduce_enabled_;
 
 public:
@@ -486,6 +490,13 @@ public:
     double GetInternodeEfficiencyFactor() const { return internode_efficiency_factor_; }
     bool   GetHierarchicalAllReduceEnabled() const {
         return hierarchical_allreduce_enabled_;
+    }
+    // Caller-side toggle for the hierarchical AllReduce cost model. The
+    // FFI / CLI is the only way to enable Step 9 - there is no .config
+    // key. Default state is OFF (built-in C++ default in the constructor).
+    // Idempotent.
+    void   SetHierarchicalAllReduceEnabled(bool enabled) {
+        hierarchical_allreduce_enabled_ = enabled;
     }
 
     // ----- Step 9: hierarchical AllReduce helpers -----

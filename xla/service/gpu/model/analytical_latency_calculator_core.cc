@@ -1333,6 +1333,19 @@ absl::Status RunAnalyticalLatencyCalculation(
       llvm::outs().flush();
       continue;
     }
+    // Step 9: per-call selection of the Calcium hierarchical AllReduce
+    // cost model. -1 (default) keeps the built-in OFF state for byte-
+    // stable flat AR; 0/1 explicitly turn the model off/on. There is
+    // intentionally no config-file key for this; the FFI / CLI is the
+    // only way to enable hierarchical AR. Silently ignored for non-
+    // Calcium archs.
+    if (opts.hierarchical_allreduce_enabled >= 0) {
+      if (auto* calcium =
+              dynamic_cast<CalciumClusterConfig*>(cluster_config.get())) {
+        calcium->SetHierarchicalAllReduceEnabled(
+            opts.hierarchical_allreduce_enabled != 0);
+      }
+    }
     // First pass: Calculate costs for all computations and populate computation_map
     for (xla::HloComputation *computation : hlo_module->computations()) {
       comp_total_cost = 0;

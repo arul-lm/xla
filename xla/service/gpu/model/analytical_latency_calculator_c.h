@@ -104,6 +104,17 @@ int analytical_latency_calculator_run(
        values are clamped. Only the steady-state cadence (T_step) benefits
        from this; T_first / bubble / per-microbatch traversal cost use the
        raw handoff because microbatch 0 cannot hide its own handoffs.
+   hierarchical_allreduce_enabled: tri-state selector for the Step 9
+       Calcium hierarchical AllReduce cost model. Calcium-only; ignored for
+       every other arch.
+         -1 = leave at built-in OFF default (byte-stable; flat worst-pair AR)
+          0 = explicit OFF (flat worst-pair AR)
+          1 = ON  (hierarchical {Pod, Card, Server} or {Pod, Rack}
+              decomposition - see cebuq/HIERARCHICAL_ALLREDUCE_PLAN.md)
+       There is intentionally no .config file key for this flag - this
+       parameter (or the matching --hierarchical-allreduce-enabled CLI
+       flag) is the only way to turn the model on. This forces the AR
+       cost-model selection to be an explicit per-call decision.
 
    The handoff cost is computed PER BOUNDARY: for each k in [0, S-2] the
    calculator walks the Calcium fabric path between rank-0 of stage k and
@@ -121,10 +132,14 @@ int analytical_latency_calculator_run(
 
    ABI STABILITY
    -------------
-   The signature gained pipeline_comm_overlap_factor; pre-existing callers
-   need to recompile. The legacy analytical_latency_calculator_run() symbol
-   above is unchanged and forwards here with pipeline_comm_overlap_factor=0.0,
-   so callers that only use _run continue to work unmodified.
+   The signature gained pipeline_comm_overlap_factor (Step 8b) and
+   hierarchical_allreduce_enabled (Step 9); pre-existing callers of
+   _with_pipeline need to recompile. The legacy
+   analytical_latency_calculator_run() symbol above is unchanged and
+   forwards here with pipeline_comm_overlap_factor=0.0 and
+   hierarchical_allreduce_enabled=-1 (leave the AR cost model at its OFF
+   default), so callers that only use _run continue to work unmodified
+   AND keep the byte-stable flat AR cost behavior.
 
    When num_pipeline_stages <= 1, this function delegates to the same
    underlying core logic as analytical_latency_calculator_run() - the legacy
@@ -145,6 +160,7 @@ int analytical_latency_calculator_run_with_pipeline(
     int64_t pipeline_activation_bytes,
     int pipeline_microbatches,
     double pipeline_comm_overlap_factor,
+    int hierarchical_allreduce_enabled,
     char* error_buffer,
     size_t error_buffer_size);
 

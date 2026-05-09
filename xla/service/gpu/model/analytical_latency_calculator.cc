@@ -57,7 +57,17 @@ int main(int argc, char *argv[]) {
                 "Inter-stage compute/handoff overlap factor in [0.0, 1.0] "
                 "(Calcium-only). The visible per-boundary handoff cost is "
                 "multiplied by (1 - factor). 0.0 = no overlap (default, "
-                "byte-stable). 0.5 = typical 1F1B-style overlap.")};
+                "byte-stable). 0.5 = typical 1F1B-style overlap."),
+      // Step 9. Default -1 keeps the model at its built-in OFF state
+      // (flat worst-pair AR; byte-stable). There is no .config key.
+      tsl::Flag("hierarchical-allreduce-enabled",
+                &opts.hierarchical_allreduce_enabled,
+                "Tri-state selector for the Calcium hierarchical AllReduce "
+                "cost model (Step 9). -1 = leave at built-in OFF default "
+                "(byte-stable); 0 = explicit OFF (flat worst-pair AR); 1 = "
+                "ON (hierarchical {Pod, Card, Server} for q250, {Pod} or "
+                "{Pod, Rack} for q250l200). Calcium-only; ignored for "
+                "other archs. No .config key exists for this flag.")};
   xla::AppendDebugOptionsFlags(&flag_list);
   std::string usage_string = tsl::Flags::Usage(argv[0], flag_list);
   if (!tsl::Flags::Parse(&argc, argv, flag_list)) {

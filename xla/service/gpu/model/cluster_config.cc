@@ -1258,13 +1258,14 @@ bool CalciumClusterConfig::LoadFromFile(const std::string &config_file_path) {
       pods_per_rack_ = std::stoi(value);
     } else if (key == "servers_per_rack") {
       servers_per_rack_ = std::stoi(value);
-    } else if (key == "hierarchical_allreduce_enabled") {
-      // Accept "1"/"0"/"true"/"false" (case-insensitive).
-      std::string v = value;
-      std::transform(v.begin(), v.end(), v.begin(),
-                     [](unsigned char ch) { return std::tolower(ch); });
-      hierarchical_allreduce_enabled_ = (v == "1" || v == "true" || v == "yes");
     }
+    // NOTE: hierarchical AllReduce (Step 9) is intentionally NOT parsed
+    // from the .config file. It is controlled exclusively via the FFI
+    // parameter `hierarchical_allreduce_enabled` on
+    // analytical_latency_calculator_run_with_pipeline (or the matching
+    // `--hierarchical-allreduce-enabled` CLI flag). The default in this
+    // class is OFF, so legacy callers that don't touch the FFI knob keep
+    // the byte-stable flat worst-pair AR cost model.
   }
 
   file.close();

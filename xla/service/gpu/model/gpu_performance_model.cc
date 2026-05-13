@@ -300,15 +300,23 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
   constexpr double kF_REF = 1e12;
   constexpr double kU_MIN = 0.1;
 
-  // kKAPPA is per-arch: HBM-backed devices (Blackwell, Rubin) use 0.04 because
-  // their high memory bandwidth (~8 TB/s) lets compute saturate quickly with
-  // moderate FLOP counts. Calcium runs LPDDR (308 GB/s, ~26x lower), so
-  // small kernels become memory-bound far earlier; an HBM-tuned kKAPPA would
-  // systematically over-estimate Calcium's effective FLOPS. The 0.015 value
-  // is a conservative starting estimate; refine via Step 5b calibration once
-  // measured Calcium matmul timings are available.
+  // kKAPPA is per-arch. HBM-backed devices (Blackwell, Rubin) use 0.04
+  // because their high memory bandwidth (~8 TB/s) lets compute saturate
+  // quickly with moderate FLOP counts.
+  //
+  // Calcium runs LPDDR (308 GB/s, ~26x lower) and would in principle want a
+  // smaller kKAPPA: a strict bandwidth-proportional scaling
+  // (0.04 * 308/8000) suggests ~0.0015. We do NOT yet have measured Calcium
+  // matmul timings to fit a value, so kKAPPA_CALCIUM is held at the HBM
+  // default for now -- this aligns small-kernel saturation behavior with
+  // every other arch the model covers, at the known cost of over-estimating
+  // effective FLOPS for sub-saturation Calcium kernels. The named constant
+  // and IsCalcium gate are preserved as the calibration hook for Step 5b
+  // (cebuq/INTEGRATION_GUIDE.md): once silicon timings arrive, only this
+  // line changes.
   constexpr double kKAPPA_DEFAULT = 0.04;     // HBM-tuned (Blackwell, Rubin)
-  constexpr double kKAPPA_CALCIUM = 0.015;    // LPDDR-tuned (Calcium / q250)
+  constexpr double kKAPPA_CALCIUM = 0.04;     // pending Calcium calibration;
+                                              // see comment above
   const double kappa =
       IsCalcium(gpu_device_info) ? kKAPPA_CALCIUM : kKAPPA_DEFAULT;
 

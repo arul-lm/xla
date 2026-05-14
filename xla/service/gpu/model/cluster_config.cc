@@ -1186,6 +1186,9 @@ CalciumClusterConfig::CalciumClusterConfig()
       socs_per_rack_(0),
       pods_per_rack_(0),
       servers_per_rack_(7),
+      num_racks_(1),
+      optical_spine_uplink_gbytes_(0.0),
+      optical_spine_oversubscription_(1.0),
       intranode_efficiency_factor_(0.95),
       internode_efficiency_factor_(0.85),
       device_id_layout_("row_major_socs_first"),
@@ -1258,6 +1261,12 @@ bool CalciumClusterConfig::LoadFromFile(const std::string &config_file_path) {
       pods_per_rack_ = std::stoi(value);
     } else if (key == "servers_per_rack") {
       servers_per_rack_ = std::stoi(value);
+    } else if (key == "num_racks") {
+      num_racks_ = std::stoi(value);
+    } else if (key == "optical_spine_uplink_gbytes") {
+      optical_spine_uplink_gbytes_ = std::stod(value);
+    } else if (key == "optical_spine_oversubscription") {
+      optical_spine_oversubscription_ = std::stod(value);
     }
     // NOTE: hierarchical AllReduce (Step 9) is intentionally NOT parsed
     // from the .config file. It is controlled exclusively via the FFI
@@ -1288,6 +1297,20 @@ bool CalciumClusterConfig::LoadFromFile(const std::string &config_file_path) {
                 << std::endl;
       return false;
     }
+    // Multi-rack mode: must supply a non-zero spine uplink so that
+    // EffectiveBandwidth on the OpticalSwitch<->OpticalSpine hop is well
+    // defined. N == 1 needs no spine (cross-rack branch is unreachable).
+    if (num_racks_ > 1 && optical_spine_uplink_gbytes_ <= 0.0) {
+      std::cerr << "ERROR: CalciumClusterConfig::LoadFromFile - q250l200 "
+                   "config has num_racks="
+                << num_racks_
+                << " > 1 but optical_spine_uplink_gbytes is unset or <= 0. "
+                   "Set optical_spine_uplink_gbytes (e.g. socs_per_rack * "
+                   "optical_port_bw_gbytes for non-blocking spine)."
+                << std::endl;
+      return false;
+    }
+    if (num_racks_ < 1) num_racks_ = 1;
   }
 
   return true;
@@ -1354,10 +1377,13 @@ CalciumClusterConfig::PathBetweenDevices(int64_t src, int64_t dst) const {
       return {PathComponent::GPU, PathComponent::OpticalSwitch,
               PathComponent::GPU};
     }
-    // Cross-rack: SoC -> NIC direct (the L4 RoCE NIC sits on a per-server
-    // egress plane, not behind the optical switch). 4 hops total.
-    return {PathComponent::GPU, PathComponent::NIC, PathComponent::ToRSwitch,
-            PathComponent::NIC, PathComponent::GPU};
+    // Cross-rack: stay in the scale-up optical domain via the rack-aggregation
+    // OpticalSpine. 4 hops total, no L4 RoCE / ToR. Reaching this branch
+    // requires num_racks_ > 1 (otherwise every legal id has rack == 0 and
+    // s.rack == d.rack always holds, preserving the N=1 byte-stable behavior).
+    return {PathComponent::GPU, PathComponent::OpticalSwitch,
+            PathComponent::OpticalSpine, PathComponent::OpticalSwitch,
+            PathComponent::GPU};
   }
 
   // q250 (legacy 4-level PCIe + RoCE).
@@ -1403,9 +1429,17 @@ double CalciumClusterConfig::StaticLinkBandwidth(PathComponent a,
     return optical_port_bw_gbytes_;
   if (IsLink(a, b, PathComponent::GPU, PathComponent::OpticalSwitch))
     return optical_port_bw_gbytes_;
+  // q250l200 cross-rack optical spine: the rack-wide OpticalSwitch uplinks
+  // into a datacenter-scale OpticalSpine. The link_bw is the per-rack uplink
+  // aggregate; per-SoC effective BW is link_bw / devices_sharing (capped at
+  // the SoC's own optical_port_bw_gbytes_ leaf cap in EffectiveBandwidth).
+  if (IsLink(a, b, PathComponent::OpticalSwitch, PathComponent::OpticalSpine))
+    return optical_spine_uplink_gbytes_;
   // q250l200 cross-rack: SoC connects directly to its server's L4 NIC
   // (per-server bundle, 800 GB/s aggregate). Leaf cap (the SoC's egress
-  // port) is enforced separately in EffectiveBandwidth.
+  // port) is enforced separately in EffectiveBandwidth. This path is no
+  // longer emitted by PathBetweenDevices but the entry is retained so that
+  // direct callers (diagnostics, tests) keep working.
   if (IsLink(a, b, PathComponent::GPU, PathComponent::NIC))
     return host_nic_link_bw_gbytes_;
   // q250 4-level PCIe + L4 RoCE.
@@ -1433,6 +1467,8 @@ double CalciumClusterConfig::StaticOversubscription(PathComponent a,
     return l3_oversubscription_;
   if (IsLink(a, b, PathComponent::GPU, PathComponent::OpticalSwitch))
     return optical_switch_oversubscription_;
+  if (IsLink(a, b, PathComponent::OpticalSwitch, PathComponent::OpticalSpine))
+    return optical_spine_oversubscription_;
   // SoC<->SoC interposer link (q250l200), L1 (non-blocking), host-internal,
   // L4 ToR uplinks, SoC<->NIC: no internal oversub.
   return 1.0;
@@ -1507,6 +1543,14 @@ int CalciumClusterConfig::ComputeDevicesSharingHop(
       IsLink(a, b, PathComponent::GPU, PathComponent::NIC)) {
     return MaxGroupSize([this](CalciumCoord c) -> int64_t {
       return static_cast<int64_t>(c.rack) * servers_per_rack_ + c.server;
+    });
+  }
+  // OpticalSwitch<->OpticalSpine (q250l200 cross-rack): per-rack uplink to
+  // the datacenter-scale spine, shared by all SoCs in the rack that
+  // participate in this collective.
+  if (IsLink(a, b, PathComponent::OpticalSwitch, PathComponent::OpticalSpine)) {
+    return MaxGroupSize([](CalciumCoord c) -> int64_t {
+      return c.rack;
     });
   }
   return 1;

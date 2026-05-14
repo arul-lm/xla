@@ -21,11 +21,11 @@ struct CommCostStats;
 //
 // The first six entries (GPU..CoreSwitch) are used by GpuClusterConfig and
 // must keep their current ordering. The remaining entries (L1Switch..
-// OpticalSwitch) are used exclusively by CalciumClusterConfig to model the
+// OpticalSpine) are used exclusively by CalciumClusterConfig to model the
 // q250 4-level PCIe + L4 Ethernet fabric and the q250l200 hybrid optical
-// fabric. They are unreachable from GpuClusterConfig::PathBetweenDevices
-// (which only emits the first six), so existing arch behavior (TPU, B200,
-// B300, R200, R576, RCPX) is unaffected.
+// fabric (intra-rack + datacenter-scale optical spine). They are unreachable
+// from GpuClusterConfig::PathBetweenDevices (which only emits the first six),
+// so existing arch behavior (TPU, B200, B300, R200, R576, RCPX) is unaffected.
 //
 // PathComponent::GPU is the cross-arch enum and is used for the q250/q250l200
 // "SoC" device too. Calcium docs and user-facing artifacts render this as
@@ -42,7 +42,8 @@ enum class PathComponent {
     L2Switch,       // Calcium q250: PCIe Gen6 x32 L1 <-> L2 switch (intra-card)
     L3Switch,       // Calcium q250: PCIe Gen6 x64 L2 <-> L3 switch (intra-server)
     ToRSwitch,      // Calcium: Ethernet RoCE v2 NIC <-> ToR switch (inter-server)
-    OpticalSwitch   // Calcium q250l200: rack-wide optical switch (cross-pod intra-rack)
+    OpticalSwitch,  // Calcium q250l200: rack-wide optical switch (cross-pod intra-rack)
+    OpticalSpine    // Calcium q250l200: cross-rack optical aggregation (datacenter-scale)
 };
 
 // Communication type enum for node-level analysis
@@ -362,13 +363,25 @@ private:
 
     // q250l200 optical fabric (set when optical_port_bw_gbytes > 0). When
     // is_l200_ is true, the L1/L2/L3 PCIe fields are NOT used by intra-rack
-    // path-finding; only optical_port + rack switch + L4 RoCE are emitted.
+    // path-finding; only optical_port + rack switch (+ optional cross-rack
+    // optical spine) are emitted.
     bool   is_l200_;
     double optical_port_bw_gbytes_;            // 640 GB/s per-SoC optical port
     double optical_switch_oversubscription_;   // typically 1.0 (non-blocking)
     int    socs_per_rack_;                     // 1344
     int    pods_per_rack_;                     // 168 = 1344/8
     int    servers_per_rack_;                  // 7
+
+    // Multi-rack fabric (q250l200 only). N == 1 (default) preserves the
+    // existing single-rack behavior: cross-rack PathBetweenDevices branches
+    // are unreachable because every legal device id decodes to rack == 0.
+    // N > 1 enables the cross-rack optical-spine path
+    //   SoC -> OpticalSwitch (rack) -> OpticalSpine -> OpticalSwitch (rack) -> SoC
+    // which stays in the scale-up domain (no ToRSwitch, no L4 RoCE) and is
+    // tunable via optical_spine_uplink_gbytes_ + optical_spine_oversubscription_.
+    int    num_racks_;                         // 1 = single-rack (byte-stable)
+    double optical_spine_uplink_gbytes_;       // per rack-to-spine optical uplink
+    double optical_spine_oversubscription_;    // 1.0 = non-blocking spine
 
     // Efficiency factors.
     double intranode_efficiency_factor_;

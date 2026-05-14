@@ -298,7 +298,6 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
   // Apply same saturation model as WGMMA path for consistency.
   constexpr double kU_MAX = 0.80;
   constexpr double kF_REF = 1e12;
-  constexpr double kU_MIN = 0.1;
 
   // kKAPPA is per-arch. HBM-backed devices (Blackwell, Rubin) use 0.04
   // because their high memory bandwidth (~8 TB/s) lets compute saturate
@@ -320,8 +319,20 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
   const double kappa =
       IsCalcium(gpu_device_info) ? kKAPPA_CALCIUM : kKAPPA_DEFAULT;
 
+  // kU_MIN is the small-FLOP utilization floor. Heavily-sharded Calcium
+  // workloads (e.g. TP across a full rack) push per-SoC FLOPs well below
+  // F_REF and would otherwise pin every small op to the HBM floor of 0.10.
+  // Calcium uses a higher floor (0.35) to reflect that its matrix unit
+  // retains a larger fraction of peak on tiny per-SoC tiles than HBM GPUs do.
+  // This is the kU_MIN counterpart to kKAPPA_CALCIUM and is a calibration
+  // hook for Step 5b -- once silicon timings arrive, only this line changes.
+  constexpr double kU_MIN_DEFAULT = 0.10;
+  constexpr double kU_MIN_CALCIUM = 0.35;
+  const double u_min =
+      IsCalcium(gpu_device_info) ? kU_MIN_CALCIUM : kU_MIN_DEFAULT;
+
   double utilization = std::max(
-      kU_MIN,
+      u_min,
       kU_MAX * (1.0 - std::exp(-kappa * static_cast<double>(flops) / kF_REF)));
   double effective_ops_per_ns = static_cast<double>(peak_ops_per_ns) * utilization;
 

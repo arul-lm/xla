@@ -156,7 +156,10 @@ bool IsCalcium(const stream_executor::DeviceDescription& device_info) {
 bool IsQ300(const stream_executor::DeviceDescription& device_info) {
   auto name = device_info.name();
   std::string lower_name = absl::AsciiStrToLower(name);
-  return absl::StrContains(lower_name, "q300");
+  // q302 is the 3-rack deployment variant of q300; chip is identical, so
+  // the same saturation constants apply.
+  return absl::StrContains(lower_name, "q300") ||
+         absl::StrContains(lower_name, "q302");
 }
 
 // Helper function to get Blackwell tensor core multiplier based on data type

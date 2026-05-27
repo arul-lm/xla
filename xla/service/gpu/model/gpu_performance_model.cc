@@ -150,6 +150,15 @@ bool IsCalcium(const stream_executor::DeviceDescription& device_info) {
          absl::StrContains(lower_name, "calcium");
 }
 
+// Q300 is a 2026 successor accelerator with QNM memory (~1.74 TB/s) and
+// per-SoC peak ~3.3 PFLOPS FP8. Uses the same matrix-unit dispatch as
+// Calcium but with Q300-tuned saturation constants.
+bool IsQ300(const stream_executor::DeviceDescription& device_info) {
+  auto name = device_info.name();
+  std::string lower_name = absl::AsciiStrToLower(name);
+  return absl::StrContains(lower_name, "q300");
+}
+
 // Helper function to get Blackwell tensor core multiplier based on data type
 // Returns a multiplier relative to bf16 performance (1.0 = bf16 baseline)
 double GetBlackwellDataTypeMultiplier(const xla::HloInstruction* instr) {
@@ -316,8 +325,10 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
   constexpr double kKAPPA_DEFAULT = 0.04;     // HBM-tuned (Blackwell, Rubin)
   constexpr double kKAPPA_CALCIUM = 0.04;     // pending Calcium calibration;
                                               // see comment above
-  const double kappa =
-      IsCalcium(gpu_device_info) ? kKAPPA_CALCIUM : kKAPPA_DEFAULT;
+  constexpr double kKAPPA_Q300 = 0.04;        // pending Q300 calibration
+  const double kappa = IsQ300(gpu_device_info)      ? kKAPPA_Q300
+                       : IsCalcium(gpu_device_info) ? kKAPPA_CALCIUM
+                                                    : kKAPPA_DEFAULT;
 
   // kU_MIN is the small-FLOP utilization floor. Heavily-sharded Calcium
   // workloads (e.g. TP across a full rack) push per-SoC FLOPs well below
@@ -328,12 +339,20 @@ absl::Duration ComputeTimeFromPeakMatrixOps(
   // hook for Step 5b -- once silicon timings arrive, only this line changes.
   constexpr double kU_MIN_DEFAULT = 0.10;
   constexpr double kU_MIN_CALCIUM = 0.35;
-  const double u_min =
-      IsCalcium(gpu_device_info) ? kU_MIN_CALCIUM : kU_MIN_DEFAULT;
+  constexpr double kU_MIN_Q300 = 0.35;
+  const double u_min = IsQ300(gpu_device_info)      ? kU_MIN_Q300
+                       : IsCalcium(gpu_device_info) ? kU_MIN_CALCIUM
+                                                    : kU_MIN_DEFAULT;
+
+  // Q300 FP8 peak is ~33x q250; scale F_REF so saturation onset tracks the
+  // higher per-SoC throughput envelope (cebuq/Q300_INTEGRATION_PLAN.md Step 6).
+  constexpr double kF_REF_Q300 = 33e12;
+  const double f_ref =
+      IsQ300(gpu_device_info) ? kF_REF_Q300 : kF_REF;
 
   double utilization = std::max(
       u_min,
-      kU_MAX * (1.0 - std::exp(-kappa * static_cast<double>(flops) / kF_REF)));
+      kU_MAX * (1.0 - std::exp(-kappa * static_cast<double>(flops) / f_ref)));
   double effective_ops_per_ns = static_cast<double>(peak_ops_per_ns) * utilization;
 
   // LOG(INFO) << "PeakMatrixOpsPerNs: " << peak_ops_per_ns
@@ -411,6 +430,16 @@ EstimateRunTimeData GpuPerformanceModel::EstimateRunTimeForInstructionImpl(
                                                 &effective_ops_per_ns);
     if (effective_ops_per_ns > 0) {
       effective_matrix_tflops = effective_ops_per_ns / 1000.0;  // ops/ns -> TFLOPS
+    }
+  } else if (IsQ300(device_info_)) {
+    // Q300: non-CUDA accelerator, peak FLOPS from matrix_unit_description in
+    // q300.txtpb. Saturation curve uses Q300-tuned constants inside
+    // ComputeTimeFromPeakMatrixOps.
+    double effective_ops_per_ns = 0.0;
+    compute_time = ComputeTimeFromPeakMatrixOps(device_info_, flops, instr,
+                                                &effective_ops_per_ns);
+    if (effective_ops_per_ns > 0) {
+      effective_matrix_tflops = effective_ops_per_ns / 1000.0;
     }
   } else if (IsCalcium(device_info_)) {
     // Calcium (q250): non-CUDA accelerator, peak FLOPS from

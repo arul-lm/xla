@@ -43,7 +43,8 @@ enum class PathComponent {
     L3Switch,       // Calcium q250: PCIe Gen6 x64 L2 <-> L3 switch (intra-server)
     ToRSwitch,      // Calcium: Ethernet RoCE v2 NIC <-> ToR switch (inter-server)
     OpticalSwitch,  // Calcium q250l200: rack-wide optical switch (cross-pod intra-rack)
-    OpticalSpine    // Calcium q250l200: cross-rack optical aggregation (datacenter-scale)
+    OpticalSpine,   // Calcium q250l200: cross-rack optical aggregation (datacenter-scale)
+    EthSwitch       // Q300: flat ESUN 1.0 single-tier rack switch (intra-rack only)
 };
 
 // Communication type enum for node-level analysis
@@ -576,6 +577,63 @@ public:
         double tensor_bytes,
         const std::vector<Tier>& tiers,
         int parallel_rails) const;
+};
+
+// Q300 physical coordinate: flat (rack, card_in_rack, soc_in_card).
+// v1 is single-rack only (rack == 0 always).
+struct Q300Coord {
+    int rack;          // 0 in v1
+    int card_in_rack;  // 0..71
+    int soc_in_card;   // 0..7
+};
+
+// Q300ClusterConfig: flat 1-tier ESUN Ethernet scale-up fabric for the Q300
+// accelerator (hw_arch token q300). Any intra-rack SoC pair is modeled as
+// SoC -> EthSwitch -> SoC (2 hops). Cross-rack is rejected at config load.
+class Q300ClusterConfig : public ClusterConfig {
+private:
+    std::string name_pattern_;
+    int socs_per_card_;
+    int cards_per_rack_;
+    int socs_per_rack_;
+    int num_racks_;
+    double eic_port_bw_gbytes_;
+    double fabric_oversubscription_;
+    int parallel_rails_;
+    double intranode_efficiency_factor_;
+    double internode_efficiency_factor_;
+    std::string device_id_layout_;
+
+public:
+    Q300ClusterConfig();
+    virtual ~Q300ClusterConfig() = default;
+
+    std::string GetNamePattern() const override;
+    bool LoadFromFile(const std::string& config_file_path) override;
+    CommCostStats CalculateCommCost(double per_device_comm_volume,
+        const stream_executor::DeviceDescription& device_info,
+        const xla::HloInstruction* instr, uint64_t replica_group_size,
+        uint64_t num_replica_groups,
+        const std::vector<int64_t>& device_ids,
+        const std::vector<int>& mesh_shape,
+        const std::string& hardware_architecture,
+        const std::string& fallback_device_type) override;
+
+    Q300Coord DecodeId(int64_t id) const;
+    std::vector<PathComponent> PathBetweenDevices(int64_t src, int64_t dst) const;
+    double StaticLinkBandwidth(PathComponent a, PathComponent b) const;
+    double StaticOversubscription(PathComponent a, PathComponent b) const;
+    double EffectiveBandwidth(PathComponent a, PathComponent b,
+                              int devices_sharing) const;
+    int ComputeDevicesSharingHop(PathComponent a, PathComponent b,
+                                 const std::vector<int64_t>& device_ids) const;
+    CommType DetermineCommTypeFromPath(
+        const std::vector<PathComponent>& path) const;
+
+    double GetIntranodeEfficiencyFactor() const {
+        return intranode_efficiency_factor_;
+    }
+    int GetParallelRails() const { return parallel_rails_; }
 };
 
 // Factory function to create cluster config based on device type

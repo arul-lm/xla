@@ -478,6 +478,8 @@ CommType GpuClusterConfig::DetermineCommTypeFromPath(
       case PathComponent::L3Switch:
       case PathComponent::ToRSwitch:
       case PathComponent::OpticalSwitch:
+      case PathComponent::OpticalSpine:
+      case PathComponent::EthSwitch:
         break;
     }
   }
@@ -674,6 +676,8 @@ std::unique_ptr<ClusterConfig>
 CreateClusterConfig(const std::string &device_type) {
   if (device_type.find("tpu") != std::string::npos) {
     return std::make_unique<TpuClusterConfig>();
+  } else if (device_type.find("q300") != std::string::npos) {
+    return std::make_unique<Q300ClusterConfig>();
   } else if (device_type.find("q250") != std::string::npos ||
              device_type.find("calcium") != std::string::npos) {
     // Calcium uses a dedicated 4-level fabric-routing config that
@@ -707,6 +711,9 @@ std::unique_ptr<ClusterConfig> GetClusterConfigByName(
     if (device_name.find("tpu") != std::string::npos) {
       return std::make_unique<TpuClusterConfig>(
           *static_cast<TpuClusterConfig *>(it->second.get()));
+    } else if (device_name.find("q300") != std::string::npos) {
+      return std::make_unique<Q300ClusterConfig>(
+          *static_cast<Q300ClusterConfig *>(it->second.get()));
     } else if (device_name.find("q250") != std::string::npos ||
                device_name.find("calcium") != std::string::npos) {
       return std::make_unique<CalciumClusterConfig>(
@@ -737,6 +744,9 @@ std::unique_ptr<ClusterConfig> GetClusterConfigByName(
     if (device_name.find("tpu") != std::string::npos) {
       config_cache[device_name] = std::make_unique<TpuClusterConfig>(
           *static_cast<TpuClusterConfig *>(config.get()));
+    } else if (device_name.find("q300") != std::string::npos) {
+      config_cache[device_name] = std::make_unique<Q300ClusterConfig>(
+          *static_cast<Q300ClusterConfig *>(config.get()));
     } else if (device_name.find("q250") != std::string::npos ||
                device_name.find("calcium") != std::string::npos) {
       config_cache[device_name] = std::make_unique<CalciumClusterConfig>(
@@ -2053,6 +2063,269 @@ CommCostStats CalciumClusterConfig::CalculateCommCost(
           internode_comm_vol_gb,
           avg_bandwidth_gbps,  // intranode_comm_bw_gbps
           avg_bandwidth_gbps,  // internode_comm_bw_gbps
+          total_comm_vol_gb,
+          per_device_comm_vol_gb,
+          max_hops,
+          per_link_cost_us};
+}
+
+// ============================================================================
+// Q300ClusterConfig Implementation
+//
+// Flat 1-tier ESUN Ethernet scale-up: any intra-rack pair is
+// SoC -> EthSwitch -> SoC (2 hops). Cross-rack is rejected at load.
+// ============================================================================
+
+Q300ClusterConfig::Q300ClusterConfig()
+    : name_pattern_(""),
+      socs_per_card_(8),
+      cards_per_rack_(72),
+      socs_per_rack_(576),
+      num_racks_(1),
+      eic_port_bw_gbytes_(200.0),
+      fabric_oversubscription_(1.0),
+      parallel_rails_(8),
+      intranode_efficiency_factor_(0.95),
+      internode_efficiency_factor_(1.0),
+      device_id_layout_("row_major_socs_first") {}
+
+std::string Q300ClusterConfig::GetNamePattern() const { return name_pattern_; }
+
+bool Q300ClusterConfig::LoadFromFile(const std::string &config_file_path) {
+  std::ifstream file(config_file_path);
+  if (!file.is_open()) {
+    std::cerr << "ERROR: Q300ClusterConfig::LoadFromFile - Cannot open file: "
+              << config_file_path << std::endl;
+    return false;
+  }
+
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    size_t eq_pos = line.find('=');
+    if (eq_pos == std::string::npos) continue;
+
+    std::string key = line.substr(0, eq_pos);
+    std::string value = line.substr(eq_pos + 1);
+    key.erase(0, key.find_first_not_of(" \t"));
+    key.erase(key.find_last_not_of(" \t") + 1);
+    value.erase(0, value.find_first_not_of(" \t"));
+    value.erase(value.find_last_not_of(" \t") + 1);
+
+    if (key == "name_pattern") {
+      name_pattern_ = value;
+    } else if (key == "device_id_layout") {
+      device_id_layout_ = value;
+    } else if (key == "socs_per_card") {
+      socs_per_card_ = std::stoi(value);
+    } else if (key == "cards_per_rack") {
+      cards_per_rack_ = std::stoi(value);
+    } else if (key == "socs_per_rack") {
+      socs_per_rack_ = std::stoi(value);
+    } else if (key == "num_racks") {
+      num_racks_ = std::stoi(value);
+    } else if (key == "eic_port_bw_gbytes") {
+      eic_port_bw_gbytes_ = std::stod(value);
+    } else if (key == "fabric_oversubscription") {
+      fabric_oversubscription_ = std::stod(value);
+    } else if (key == "parallel_rails") {
+      parallel_rails_ = std::stoi(value);
+    } else if (key == "intranode_efficiency_factor") {
+      intranode_efficiency_factor_ = std::stod(value);
+    } else if (key == "internode_efficiency_factor") {
+      internode_efficiency_factor_ = std::stod(value);
+    }
+    // per_soc_memory_* keys are informational for now; memory comes from
+    // q300.txtpb via the performance model.
+  }
+
+  file.close();
+
+  if (device_id_layout_ != "row_major_socs_first") {
+    std::cerr << "ERROR: Q300ClusterConfig::LoadFromFile - Unsupported "
+                 "device_id_layout: "
+              << device_id_layout_ << " (only row_major_socs_first supported)"
+              << std::endl;
+    return false;
+  }
+
+  if (num_racks_ != 1) {
+    std::cerr << "ERROR: Q300ClusterConfig::LoadFromFile - q300 v1 supports "
+                 "only num_racks=1 (single-rack scale-up domain). Got: "
+              << num_racks_ << std::endl;
+    return false;
+  }
+
+  if (socs_per_rack_ <= 0 || socs_per_card_ <= 0 || cards_per_rack_ <= 0) {
+    std::cerr << "ERROR: Q300ClusterConfig::LoadFromFile - socs_per_rack, "
+                 "socs_per_card, and cards_per_rack must be > 0."
+              << std::endl;
+    return false;
+  }
+
+  if (parallel_rails_ < 1) parallel_rails_ = 1;
+
+  return true;
+}
+
+Q300Coord Q300ClusterConfig::DecodeId(int64_t id) const {
+  Q300Coord c{};
+  const int64_t socs_per_rack =
+      static_cast<int64_t>(socs_per_rack_) > 0
+          ? static_cast<int64_t>(socs_per_rack_)
+          : static_cast<int64_t>(cards_per_rack_) *
+                static_cast<int64_t>(socs_per_card_);
+  const int64_t socs_per_card = static_cast<int64_t>(socs_per_card_);
+
+  c.rack = static_cast<int>(id / socs_per_rack);
+  const int64_t within_rack = id % socs_per_rack;
+  c.card_in_rack = static_cast<int>(within_rack / socs_per_card);
+  c.soc_in_card = static_cast<int>(within_rack % socs_per_card);
+  return c;
+}
+
+std::vector<PathComponent> Q300ClusterConfig::PathBetweenDevices(
+    int64_t src, int64_t dst) const {
+  Q300Coord s = DecodeId(src);
+  Q300Coord d = DecodeId(dst);
+
+  if (s.rack == d.rack && s.card_in_rack == d.card_in_rack &&
+      s.soc_in_card == d.soc_in_card) {
+    return {PathComponent::GPU};
+  }
+
+  return {PathComponent::GPU, PathComponent::EthSwitch, PathComponent::GPU};
+}
+
+double Q300ClusterConfig::StaticLinkBandwidth(PathComponent a,
+                                              PathComponent b) const {
+  if (IsLink(a, b, PathComponent::GPU, PathComponent::EthSwitch)) {
+    return eic_port_bw_gbytes_;
+  }
+  return 1.0;
+}
+
+double Q300ClusterConfig::StaticOversubscription(PathComponent a,
+                                                 PathComponent b) const {
+  if (IsLink(a, b, PathComponent::GPU, PathComponent::EthSwitch)) {
+    return fabric_oversubscription_;
+  }
+  return 1.0;
+}
+
+double Q300ClusterConfig::EffectiveBandwidth(PathComponent a, PathComponent b,
+                                             int devices_sharing) const {
+  if (devices_sharing < 1) devices_sharing = 1;
+  if (IsLink(a, b, PathComponent::GPU, PathComponent::EthSwitch)) {
+    // Per-SoC dedicated EIC egress; never shared across replica-group peers.
+    return eic_port_bw_gbytes_;
+  }
+  return 1.0;
+}
+
+int Q300ClusterConfig::ComputeDevicesSharingHop(
+    PathComponent a, PathComponent b,
+    const std::vector<int64_t> &device_ids) const {
+  if (IsLink(a, b, PathComponent::GPU, PathComponent::EthSwitch)) {
+    return 1;
+  }
+  (void)device_ids;
+  return 1;
+}
+
+CommType Q300ClusterConfig::DetermineCommTypeFromPath(
+    const std::vector<PathComponent> &path) const {
+  for (PathComponent c : path) {
+    if (c == PathComponent::EthSwitch) {
+      return CommType::ScaleUp;
+    }
+  }
+  return CommType::ScaleUp;
+}
+
+CommCostStats Q300ClusterConfig::CalculateCommCost(
+    double per_device_comm_volume,
+    const stream_executor::DeviceDescription & /*device_info*/,
+    const xla::HloInstruction * /*instr*/, uint64_t replica_group_size,
+    uint64_t /*num_replica_groups*/, const std::vector<int64_t> &device_ids,
+    const std::vector<int> & /*mesh_shape*/,
+    const std::string & /*hardware_architecture*/,
+    const std::string & /*fallback_device_type*/) {
+  if (per_device_comm_volume < 0.0) {
+    CHECK_GE(per_device_comm_volume, 0.0)
+        << "per_device_comm_volume must be >= 0, got: "
+        << per_device_comm_volume;
+  }
+  if (device_ids.empty()) {
+    LOG(FATAL) << "Q300ClusterConfig::CalculateCommCost - device_ids "
+                  "cannot be empty";
+  }
+
+  const double per_device_comm_vol_gb =
+      per_device_comm_volume / (1024.0 * 1024.0 * 1024.0);
+
+  double max_comm_cost_us = 0.0;
+  int max_hops = 0;
+  std::vector<PathComponent> longest_path;
+  const int rails = parallel_rails_ < 1 ? 1 : parallel_rails_;
+
+  for (size_t i = 0; i < device_ids.size(); ++i) {
+    const int64_t src = device_ids[i];
+    const int64_t dst = device_ids[(i + 1) % device_ids.size()];
+    std::vector<PathComponent> path = PathBetweenDevices(src, dst);
+    if (path.size() < 2) continue;
+
+    double bottleneck_gbps = std::numeric_limits<double>::infinity();
+    for (size_t h = 0; h + 1 < path.size(); ++h) {
+      const int sharing =
+          ComputeDevicesSharingHop(path[h], path[h + 1], device_ids);
+      const double bw = EffectiveBandwidth(path[h], path[h + 1], sharing);
+      if (bw < bottleneck_gbps) bottleneck_gbps = bw;
+    }
+    if (!std::isfinite(bottleneck_gbps) || bottleneck_gbps <= 0.0) continue;
+
+    bottleneck_gbps *= static_cast<double>(rails);
+
+    const int hop_count = static_cast<int>(path.size() - 1);
+    const double hop_latency_us = 1.0;
+    const double path_cost_us =
+        (per_device_comm_vol_gb / bottleneck_gbps) * 1e6 +
+        hop_count * hop_latency_us;
+
+    if (path_cost_us > max_comm_cost_us) {
+      max_comm_cost_us = path_cost_us;
+      max_hops = hop_count;
+      longest_path = path;
+    }
+  }
+
+  CommType comm_type = CommType::ScaleUp;
+  if (!longest_path.empty()) {
+    comm_type = DetermineCommTypeFromPath(longest_path);
+  }
+
+  const double efficiency = intranode_efficiency_factor_;
+  if (efficiency > 0.0 && efficiency < 1.0 && max_comm_cost_us > 0.0) {
+    max_comm_cost_us /= efficiency;
+  }
+  (void)replica_group_size;
+
+  const double intranode_comm_vol_gb = per_device_comm_vol_gb;
+  const double internode_comm_vol_gb = 0.0;
+  const double total_comm_vol_gb = intranode_comm_vol_gb;
+  const double avg_bandwidth_gbps =
+      (max_comm_cost_us > 0.0)
+          ? per_device_comm_vol_gb / (max_comm_cost_us / 1e6)
+          : 0.0;
+  const double per_link_cost_us =
+      (max_hops > 0) ? max_comm_cost_us / max_hops : 0.0;
+
+  return {comm_type,
+          max_comm_cost_us,
+          intranode_comm_vol_gb,
+          internode_comm_vol_gb,
+          avg_bandwidth_gbps,
+          avg_bandwidth_gbps,
           total_comm_vol_gb,
           per_device_comm_vol_gb,
           max_hops,

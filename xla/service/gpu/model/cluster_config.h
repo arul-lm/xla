@@ -588,8 +588,11 @@ struct Q300Coord {
 };
 
 // Q300ClusterConfig: flat 1-tier ESUN Ethernet scale-up fabric for the Q300
-// accelerator (hw_arch token q300). Any intra-rack SoC pair is modeled as
-// SoC -> EthSwitch -> SoC (2 hops). Cross-rack is rejected at config load.
+// accelerator (hw_arch tokens q300 / q300l200). The whole scale-up domain is
+// modeled as a single non-blocking crossbar of radix
+// num_racks * socs_per_rack: any two distinct SoCs in the domain are exactly
+// one switch hop apart (SoC -> EthSwitch -> SoC), regardless of rack.
+// CommType is always ScaleUp.
 class Q300ClusterConfig : public ClusterConfig {
 private:
     std::string name_pattern_;
@@ -601,7 +604,7 @@ private:
     double fabric_oversubscription_;
     int parallel_rails_;
     double intranode_efficiency_factor_;
-    double internode_efficiency_factor_;
+    double internode_efficiency_factor_;   // parsed but unused in v1.5
     std::string device_id_layout_;
 
 public:

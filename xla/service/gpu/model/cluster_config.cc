@@ -2149,10 +2149,10 @@ bool Q300ClusterConfig::LoadFromFile(const std::string &config_file_path) {
     return false;
   }
 
-  if (num_racks_ != 1) {
-    std::cerr << "ERROR: Q300ClusterConfig::LoadFromFile - q300 v1 supports "
-                 "only num_racks=1 (single-rack scale-up domain). Got: "
-              << num_racks_ << std::endl;
+  if (num_racks_ < 1) {
+    std::cerr << "ERROR: Q300ClusterConfig::LoadFromFile - num_racks must be "
+                 ">= 1 (got "
+              << num_racks_ << ")" << std::endl;
     return false;
   }
 
@@ -2193,7 +2193,8 @@ std::vector<PathComponent> Q300ClusterConfig::PathBetweenDevices(
       s.soc_in_card == d.soc_in_card) {
     return {PathComponent::GPU};
   }
-
+  // Any other pair (intra- OR cross-rack) is one switch hop away through the
+  // domain-wide logical crossbar.
   return {PathComponent::GPU, PathComponent::EthSwitch, PathComponent::GPU};
 }
 
@@ -2304,6 +2305,8 @@ CommCostStats Q300ClusterConfig::CalculateCommCost(
     comm_type = DetermineCommTypeFromPath(longest_path);
   }
 
+  // Single-crossbar model: cross-rack and intra-rack are byte-identical, so
+  // intranode_efficiency_factor_ applies to every Q300 path.
   const double efficiency = intranode_efficiency_factor_;
   if (efficiency > 0.0 && efficiency < 1.0 && max_comm_cost_us > 0.0) {
     max_comm_cost_us /= efficiency;

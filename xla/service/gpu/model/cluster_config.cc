@@ -2082,7 +2082,7 @@ Q300ClusterConfig::Q300ClusterConfig()
       cards_per_rack_(72),
       socs_per_rack_(576),
       num_racks_(1),
-      eic_port_bw_gbytes_(200.0),
+      eic_port_bw_gbytes_(224.0),
       fabric_oversubscription_(1.0),
       parallel_rails_(8),
       intranode_efficiency_factor_(0.95),

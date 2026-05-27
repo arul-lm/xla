@@ -51,6 +51,9 @@ cebuq/
 xla/backends/gpu/target_config/specs/q250*.txtpb
 xla/service/gpu/model/configs/q250*.config
 
-# Q300 (non-CUDA, 2026 successor to Calcium) — spec is private, do not commit
+# Q300 / Q300 L200 (non-CUDA, 2026 successor to Calcium) — spec is private
 xla/backends/gpu/target_config/specs/q300*.txtpb
 xla/service/gpu/model/configs/q300*.config
+# Explicit twins (also matched by q300* above):
+xla/backends/gpu/target_config/specs/q300l200.txtpb
+xla/service/gpu/model/configs/q300l200.config

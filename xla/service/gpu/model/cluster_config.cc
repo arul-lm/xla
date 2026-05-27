@@ -840,7 +840,7 @@ IntraNodeConfig GetIntraNodeConfigFromDeviceInfo(
                << "' not found in device configurations.\n";
   llvm::outs() << "DEBUG: Available device patterns: tpuv7e, tpuv7el200, b200, "
                   "b200l200, b300, b300l200, r200, r200l200, r576, r576l200, rcpx, "
-                  "rcpxl200\n";
+                  "rcpxl200, q300, q300l200\n";
   llvm::outs() << "DEBUG: Make sure config file exists at: configs/"
                << device_name << ".config\n";
   llvm::outs().flush();

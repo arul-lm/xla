@@ -602,7 +602,6 @@ private:
     int num_racks_;
     double eic_port_bw_gbytes_;
     double fabric_oversubscription_;
-    int parallel_rails_;
     double intranode_efficiency_factor_;
     double internode_efficiency_factor_;   // parsed but unused in v1.5
     std::string device_id_layout_;
@@ -636,7 +635,6 @@ public:
     double GetIntranodeEfficiencyFactor() const {
         return intranode_efficiency_factor_;
     }
-    int GetParallelRails() const { return parallel_rails_; }
 };
 
 // Factory function to create cluster config based on device type

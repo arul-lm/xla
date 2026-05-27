@@ -2089,7 +2089,6 @@ Q300ClusterConfig::Q300ClusterConfig()
       num_racks_(1),
       eic_port_bw_gbytes_(224.0),
       fabric_oversubscription_(1.0),
-      parallel_rails_(8),
       intranode_efficiency_factor_(0.95),
       internode_efficiency_factor_(1.0),
       device_id_layout_("row_major_socs_first") {}
@@ -2134,7 +2133,10 @@ bool Q300ClusterConfig::LoadFromFile(const std::string &config_file_path) {
     } else if (key == "fabric_oversubscription") {
       fabric_oversubscription_ = std::stod(value);
     } else if (key == "parallel_rails") {
-      parallel_rails_ = std::stoi(value);
+      // Accepted for backward-compat with older configs; intentionally
+      // discarded. The 8/16 fabric mesh planes are not a per-SoC BW
+      // multiplier (per-SoC egress is already inside eic_port_bw_gbytes).
+      (void)value;
     } else if (key == "intranode_efficiency_factor") {
       intranode_efficiency_factor_ = std::stod(value);
     } else if (key == "internode_efficiency_factor") {
@@ -2167,8 +2169,6 @@ bool Q300ClusterConfig::LoadFromFile(const std::string &config_file_path) {
               << std::endl;
     return false;
   }
-
-  if (parallel_rails_ < 1) parallel_rails_ = 1;
 
   return true;
 }
@@ -2273,11 +2273,9 @@ CommCostStats Q300ClusterConfig::CalculateCommCost(
   double max_comm_cost_us = 0.0;
   int max_hops = 0;
   std::vector<PathComponent> longest_path;
-  // NOTE: `parallel_rails_` is parsed for documentation / forward-compat but
-  // is NOT a bandwidth multiplier for Q300. The EIC's 8 PAM4 lanes are
-  // already accounted for inside `eic_port_bw_gbytes` (= per-SoC scale-up
-  // egress in GB/s). The "8 rails" in the spec is the fabric mesh topology
-  // (8 logical switch planes), not 8 additional egress ports per SoC.
+  // Per-SoC scale-up egress is bounded entirely by the EIC bundle
+  // (`eic_port_bw_gbytes` = sum of all PAM4 lanes); there is no
+  // multi-rail / multi-port multiplier on top.
 
   for (size_t i = 0; i < device_ids.size(); ++i) {
     const int64_t src = device_ids[i];

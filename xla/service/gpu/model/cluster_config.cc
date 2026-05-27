@@ -2273,7 +2273,11 @@ CommCostStats Q300ClusterConfig::CalculateCommCost(
   double max_comm_cost_us = 0.0;
   int max_hops = 0;
   std::vector<PathComponent> longest_path;
-  const int rails = parallel_rails_ < 1 ? 1 : parallel_rails_;
+  // NOTE: `parallel_rails_` is parsed for documentation / forward-compat but
+  // is NOT a bandwidth multiplier for Q300. The EIC's 8 PAM4 lanes are
+  // already accounted for inside `eic_port_bw_gbytes` (= per-SoC scale-up
+  // egress in GB/s). The "8 rails" in the spec is the fabric mesh topology
+  // (8 logical switch planes), not 8 additional egress ports per SoC.
 
   for (size_t i = 0; i < device_ids.size(); ++i) {
     const int64_t src = device_ids[i];
@@ -2289,8 +2293,6 @@ CommCostStats Q300ClusterConfig::CalculateCommCost(
       if (bw < bottleneck_gbps) bottleneck_gbps = bw;
     }
     if (!std::isfinite(bottleneck_gbps) || bottleneck_gbps <= 0.0) continue;
-
-    bottleneck_gbps *= static_cast<double>(rails);
 
     const int hop_count = static_cast<int>(path.size() - 1);
     const double hop_latency_us = 1.0;

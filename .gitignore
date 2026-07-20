@@ -61,3 +61,10 @@ xla/service/gpu/model/configs/q300l200.config
 # Q302 / Q302 L200 — 3-rack deployment variants of Q300; same private spec
 xla/backends/gpu/target_config/specs/q302*.txtpb
 xla/service/gpu/model/configs/q302*.config
+
+# Q350 / Q350 L200 (Calcium-next optical core) — spec is private, do not commit
+xla/backends/gpu/target_config/specs/q350*.txtpb
+xla/service/gpu/model/configs/q350*.config
+# Explicit twins (also matched by q350* above):
+xla/backends/gpu/target_config/specs/q350l200.txtpb
+xla/service/gpu/model/configs/q350l200.config

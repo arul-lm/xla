@@ -677,9 +677,10 @@ CreateClusterConfig(const std::string &device_type) {
   if (device_type.find("tpu") != std::string::npos) {
     return std::make_unique<TpuClusterConfig>();
   } else if (device_type.find("q300") != std::string::npos ||
-             device_type.find("q302") != std::string::npos) {
-    // q302 is a 3-rack deployment variant of q300; same cluster class, only
-    // num_racks differs in the config.
+             device_type.find("q302") != std::string::npos ||
+             device_type.find("q350") != std::string::npos) {
+    // q302 is a 3-rack deployment variant of q300; q350 uses the same ESUN
+    // flat-mesh cluster class with different socs_per_card / cards_per_rack.
     return std::make_unique<Q300ClusterConfig>();
   } else if (device_type.find("q250") != std::string::npos ||
              device_type.find("calcium") != std::string::npos) {
@@ -715,7 +716,8 @@ std::unique_ptr<ClusterConfig> GetClusterConfigByName(
       return std::make_unique<TpuClusterConfig>(
           *static_cast<TpuClusterConfig *>(it->second.get()));
     } else if (device_name.find("q300") != std::string::npos ||
-               device_name.find("q302") != std::string::npos) {
+               device_name.find("q302") != std::string::npos ||
+               device_name.find("q350") != std::string::npos) {
       return std::make_unique<Q300ClusterConfig>(
           *static_cast<Q300ClusterConfig *>(it->second.get()));
     } else if (device_name.find("q250") != std::string::npos ||
@@ -749,7 +751,8 @@ std::unique_ptr<ClusterConfig> GetClusterConfigByName(
       config_cache[device_name] = std::make_unique<TpuClusterConfig>(
           *static_cast<TpuClusterConfig *>(config.get()));
     } else if (device_name.find("q300") != std::string::npos ||
-               device_name.find("q302") != std::string::npos) {
+               device_name.find("q302") != std::string::npos ||
+               device_name.find("q350") != std::string::npos) {
       config_cache[device_name] = std::make_unique<Q300ClusterConfig>(
           *static_cast<Q300ClusterConfig *>(config.get()));
     } else if (device_name.find("q250") != std::string::npos ||
@@ -845,7 +848,7 @@ IntraNodeConfig GetIntraNodeConfigFromDeviceInfo(
                << "' not found in device configurations.\n";
   llvm::outs() << "DEBUG: Available device patterns: tpuv7e, tpuv7el200, b200, "
                   "b200l200, b300, b300l200, r200, r200l200, r576, r576l200, rcpx, "
-                  "rcpxl200, q300, q300l200, q302, q302l200\n";
+                  "rcpxl200, q300, q300l200, q302, q302l200, q350, q350l200\n";
   llvm::outs() << "DEBUG: Make sure config file exists at: configs/"
                << device_name << ".config\n";
   llvm::outs().flush();
